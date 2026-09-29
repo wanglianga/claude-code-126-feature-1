@@ -1,0 +1,48 @@
+# 二进制
+/server
+coffee-server
+*.exe
+*.out
+
+# 本地数据/日志
+.pgdata/
+*.log
+tmp/
+tmpcheck/
+
+# Go
+vendor/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+# Generated/runtime files excluded from GSB delivery
+node_modules/
+**/node_modules/
+frontend/dist/
+**/dist/
+**/build/
+coverage/
+.env
+!.env.example
+.claude/
+.codex/
+traces/
+recordings/
+screenshots/
+test-results/
+temp/
+*.jsonl
+*.webm
+*.mp4
+*.har
+*.sqlite
+*.db
+*screenshot*
+*screen-capture*
+*recording*
+*trace*
+*debug*
+*temp*
+*tmp*

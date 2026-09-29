@@ -1,0 +1,552 @@
+openapi: 3.0.3
+info:
+  title: 咖啡连锁外卖出杯时效与骑手交接服务
+  version: 1.0.0
+  description: >
+    覆盖外卖平台接单（美式/拿铁/冷萃/果咖/轻食/组合套餐）、原料库存扣减、门店产能与爆单保护、
+    按序出杯、封签扫描入待取区、冷热分袋、骑手到店核验（订单号/袋数/冷热分袋/吸管餐具）、
+    骑手提前到店、饮品过久重做、漏看备注、错杯、轻食缺货、取错袋、平台取消、漏液投诉等异常，
+    并把门店、店员、骑手、顾客、平台客服、财务赔付连接到同一订单时间线；
+    支持多平台订单合并、缺货临时下架、杯贴/袋贴打印、异常报损、骑手到店屏、
+    区域利润报表、班组评分与督导复盘。
+
+
+    鉴权：所有 /v1 接口（除 /v1/auth/login）需要 `X-Staff-Code: <工号>` 请求头，
+    或先登录后使用 `Authorization: Bearer <token>`。
+servers:
+  - url: /
+    description: 本机/容器
+tags:
+  - name: auth
+  - name: catalog
+  - name: orders
+  - name: platform
+  - name: store-ops
+  - name: rider
+  - name: customer
+  - name: finance
+  - name: management
+security:
+  - StaffCode: []
+paths:
+  /healthz:
+    get:
+      tags: [catalog]
+      security: []
+      summary: 健康检查（PG/Redis）
+      responses:
+        '200': {description: OK}
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      security: []
+      summary: 用工号换取 Bearer Token（也可全程直接用 X-Staff-Code）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: {type: string, example: "3001"}
+      responses:
+        '200': {description: OK}
+        '401': {description: 工号无效}
+  /v1/auth/me:
+    get:
+      tags: [auth]
+      summary: 当前登录人
+      responses:
+        '200': {description: OK}
+  /v1/stores:
+    get:
+      tags: [catalog]
+      summary: 门店列表
+      responses:
+        '200': {description: OK}
+  /v1/stores/{id}:
+    get:
+      tags: [catalog]
+      summary: 门店详情
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/menu:
+    get:
+      tags: [catalog]
+      summary: 菜单（6 类商品）
+      responses:
+        '200': {description: OK}
+  /v1/stores/{id}/inventory:
+    get:
+      tags: [catalog]
+      summary: 门店原料库存
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/stores/{id}/delistings:
+    get:
+      tags: [catalog]
+      summary: 临时下架记录
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer}}
+        - {name: active, in: query, schema: {type: string, enum: ["0","1"]}}
+      responses:
+        '200': {description: OK}
+  /v1/stores/{id}/board:
+    get:
+      tags: [store-ops]
+      summary: 门店作业看板（在制杯量/爆单/待取超时/等待骑手/异常/下架）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/platform/orders:
+    post:
+      tags: [platform]
+      summary: 平台/门店接单（扣库存、校验爆单与缺货，幂等支持 Idempotency-Key）
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IntakeRequest'
+      responses:
+        '201': {description: 已接单}
+        '409':
+          description: 爆单限流(surge_full/surge_paused)/缺货下架(item_delisted)/库存不足(stock_shortage)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /v1/platform/orders/{id}/cancel:
+    post:
+      tags: [platform]
+      summary: 平台取消订单（未做回库、已封报损、退款、按是否门店责任归责）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: {type: string, example: 顾客申请退款}
+                store_fault: {type: boolean, description: 是否门店责任（如出杯超时导致取消）}
+      responses:
+        '200': {description: 已取消}
+  /v1/orders/{id}:
+    get:
+      tags: [orders]
+      summary: 订单详情（含杯、袋）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/orders/{id}/events:
+    get:
+      tags: [orders]
+      summary: 订单全链路时间线（门店/店员/骑手/顾客/客服/财务）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/orders/{id}/exceptions:
+    get:
+      tags: [orders]
+      summary: 订单异常列表
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/stores/{id}/orders:
+    get:
+      tags: [orders]
+      summary: 门店订单列表
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer}}
+        - {name: status, in: query, schema: {type: string, enum: [received, active, handed, canceled]}}
+      responses:
+        '200': {description: OK}
+  /v1/staff/merge:
+    post:
+      tags: [store-ops]
+      summary: 多平台订单合并（同一骑手一次取走多平台单）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_ids]
+              properties:
+                store_id: {type: integer}
+                order_ids:
+                  type: array
+                  items: {type: integer}
+                  example: [1, 2]
+                note: {type: string}
+      responses:
+        '201': {description: 已合并}
+  /v1/merged-groups/{id}:
+    get:
+      tags: [store-ops]
+      summary: 合并组详情
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/staff/stores/{id}/queue:
+    get:
+      tags: [store-ops]
+      summary: 出杯顺序队列（骑手 ETA 早的优先，含顾客备注/杯备注）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/staff/stores/{id}/cups/next:
+    post:
+      tags: [store-ops]
+      summary: 店员叫号取下一杯开始制作（FOR UPDATE SKIP LOCKED）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [store_id]
+              properties:
+                store_id: {type: integer}
+      responses:
+        '200': {description: OK}
+        '409': {description: 队列空}
+  /v1/staff/cups/{id}/start:
+    post:
+      tags: [store-ops]
+      summary: 指定杯开始制作
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/staff/cups/{id}/seal:
+    post:
+      tags: [store-ops]
+      summary: 店员扫描封签 → 入冷热/餐食分袋 → 全单封齐进待取区
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: 已封签}
+  /v1/staff/cups/{id}/remake:
+    post:
+      tags: [store-ops]
+      summary: 重做（饮品放置过久/错杯/漏看备注），旧杯报损、新杯入队，成本计入班组
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: {type: string, enum: [stale_drink, wrong_cup, note_missed]}
+                detail: {type: object, additionalProperties: true}
+      responses:
+        '201': {description: 已生成重做杯}
+  /v1/staff/orders/{id}/item-oos:
+    post:
+      tags: [store-ops]
+      summary: 接单后轻食/商品缺货 → 临时下架 + 作废旧杯回库 + 单品退款
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cup_id: {type: integer}
+                sku: {type: string, example: LF}
+                note: {type: string, example: 鸡肉卷售罄}
+      responses:
+        '200': {description: 已处理}
+  /v1/staff/orders/{id}/cup-labels:
+    get:
+      tags: [store-ops]
+      summary: 杯贴打印数据（冰热/糖度/杯型/备注/出杯序号/封签码）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/staff/orders/{id}/bag-labels:
+    get:
+      tags: [store-ops]
+      summary: 袋贴打印数据（热饮袋/冷饮袋/餐食袋、每袋杯数）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/staff/inventory/restock:
+    post:
+      tags: [store-ops]
+      summary: 原料补货（可选自动恢复因缺货下架的商品）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                store_id: {type: integer}
+                resolve_delistings: {type: boolean}
+                items:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      ingredient_sku: {type: string, example: coldbase}
+                      qty: {type: number, example: 2000}
+      responses:
+        '200': {description: OK}
+  /v1/staff/menu/{sku}/delist:
+    post:
+      tags: [store-ops]
+      summary: 门店手动临时下架
+      parameters: [{name: sku, in: path, required: true, schema: {type: string}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                store_id: {type: integer}
+                reason: {type: string}
+      responses:
+        '201': {description: OK}
+  /v1/staff/stores/{id}/surge:
+    post:
+      tags: [store-ops]
+      summary: 爆单保护开关（临时限制接单，可设时长）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                paused: {type: boolean}
+                reason: {type: string, example: 午高峰爆单}
+                minutes: {type: integer, example: 30}
+      responses:
+        '200': {description: OK}
+  /v1/staff/stores/{id}/loss-reports:
+    get:
+      tags: [store-ops]
+      summary: 门店异常报损记录
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/rider/arrivals:
+    post:
+      tags: [rider]
+      summary: 骑手到店登记（提前到店未出杯自动产生 rider_early 异常；支持合并组）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                order_id: {type: integer}
+                platform_order_no: {type: string}
+                group_id: {type: integer}
+                rider_name: {type: string}
+      responses:
+        '200': {description: OK}
+  /v1/rider/arrivals/{id}:
+    get:
+      tags: [rider]
+      summary: 到店记录（等待时长、门店责任等待时长）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/rider/screen:
+    get:
+      tags: [rider]
+      summary: 骑手到店屏（在店等待骑手与出杯进度；骑手只看自己）
+      parameters: [{name: store_id, in: query, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/rider/handoffs:
+    post:
+      tags: [rider]
+      summary: 取餐核验交接（订单号/袋数/冷热分袋/吸管餐具；不过则登记异常）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id]
+              properties:
+                order_id: {type: integer}
+                platform_order_no: {type: string, description: 骑手核验订单号（与 order_id 二选一）}
+                platform: {type: string, description: 店员按平台单号代核验时指定平台 eleme/meituan}
+                rider_name: {type: string, description: 店员代核验时填写骑手姓名}
+                actual_bags: {type: integer}
+                actual_hot: {type: integer}
+                actual_cold: {type: integer}
+                actual_food: {type: integer}
+                has_straw: {type: boolean}
+                has_utensil: {type: boolean}
+      responses:
+        '200': {description: 核验通过已交接}
+        '409':
+          description: 核验不通过/未出杯/已取消（issues 列出 wrong_bag/missing_straw/missing_utensil 等）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  passed: {type: boolean}
+                  issues: {type: array, items: {type: string}}
+  /v1/customers/orders/{id}/complain:
+    post:
+      tags: [customer]
+      summary: 顾客/平台客服投诉（漏液等），生成待财务定责异常与补偿挂账
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                type: {type: string, example: leak_complaint}
+                detail: {type: string, example: 拿铁杯盖漏液撒了半杯}
+                comp_amount: {type: number, description: 为空默认订单金额}
+      responses:
+        '201': {description: 已受理}
+  /v1/finance/exceptions/{id}:
+    patch:
+      tags: [finance]
+      summary: 财务定责（store/rider/platform/customer/shared）、确定补偿与平台分摊
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                responsibility: {type: string, enum: [store, rider, platform, customer, shared]}
+                comp_amount: {type: number}
+                platform_share: {type: number}
+                resolution: {type: string}
+      responses:
+        '200': {description: OK}
+  /v1/stores/{id}/finance:
+    get:
+      tags: [finance]
+      summary: 门店财务台账（收入/退款/重做成本/报损/顾客补偿/平台补贴与净利润影响）
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer}}
+        - {name: from, in: query, schema: {type: string, format: date}}
+        - {name: to, in: query, schema: {type: string, format: date}}
+      responses:
+        '200': {description: OK}
+  /v1/reports/stores/{id}/summary:
+    get:
+      tags: [management]
+      summary: 门店报表（出杯慢/错杯/漏餐具/重做/平台取消对利润影响）
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer}}
+        - {name: from, in: query, schema: {type: string, format: date}}
+        - {name: to, in: query, schema: {type: string, format: date}}
+      responses:
+        '200': {description: OK}
+  /v1/reports/region:
+    get:
+      tags: [management]
+      summary: 区域经理按门店对比报表
+      parameters:
+        - {name: region, in: query, schema: {type: string}}
+        - {name: from, in: query, schema: {type: string, format: date}}
+        - {name: to, in: query, schema: {type: string, format: date}}
+      responses:
+        '200': {description: OK}
+  /v1/management/stores/{id}/team-score/refresh:
+    post:
+      tags: [management]
+      summary: 刷新门店班组评分（出杯慢/错杯/漏餐具/取错袋/过久/漏备注/门店责任取消扣分）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/management/stores/{id}/team-score:
+    get:
+      tags: [management]
+      summary: 最新班组评分（含重做成本）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/management/team-scores:
+    get:
+      tags: [management]
+      summary: 区域班组评分榜
+      responses:
+        '200': {description: OK}
+  /v1/stores/{id}/reviews:
+    get:
+      tags: [management]
+      summary: 门店复盘列表（督导同步复盘）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/management/stores/{id}/reviews:
+    post:
+      tags: [management]
+      summary: 区域督导创建门店复盘（重做成本计入复盘）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to, summary]
+              properties:
+                from: {type: string, format: date}
+                to: {type: string, format: date}
+                summary: {type: string}
+                actions: {type: array, items: {type: string}}
+      responses:
+        '201': {description: OK}
+components:
+  securitySchemes:
+    StaffCode:
+      type: apiKey
+      in: header
+      name: X-Staff-Code
+    BearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: {type: string}
+        message: {type: string}
+        details: {type: object, additionalProperties: true}
+    IntakeRequest:
+      type: object
+      required: [platform, platform_order_no, items]
+      properties:
+        platform: {type: string, enum: [eleme, meituan], example: eleme}
+        platform_order_no: {type: string, example: EM20260929001}
+        store_id: {type: integer, example: 1}
+        store_code: {type: string, example: SH001}
+        customer_id: {type: string}
+        customer_note: {type: string, example: 少冰，杯盖贴紧，不要摇！}
+        promised_minutes: {type: integer, example: 15}
+        rider_eta: {type: string, format: date-time}
+        total_amount: {type: number}
+        items:
+          type: array
+          items:
+            type: object
+            required: [sku, qty, temp, sugar, cup_size]
+            properties:
+              sku: {type: string, enum: [AM, LT, CB, FC, LF, SET]}
+              qty: {type: integer, minimum: 1}
+              temp: {type: string, enum: [hot, ice]}
+              sugar: {type: string, enum: 无糖, 三分糖, 五分糖, 七分糖, 全糖}
+              cup_size: {type: string, enum: [M, L, XL]}
+              note: {type: string}

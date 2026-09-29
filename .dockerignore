@@ -1,0 +1,7 @@
+.git
+.gitignore
+*.md
+tmpcheck/
+scripts/
+*.log
+.pgdata/
