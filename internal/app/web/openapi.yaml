@@ -10,6 +10,13 @@ info:
     支持多平台订单合并、缺货临时下架、杯贴/袋贴打印、异常报损、骑手到店屏、
     区域利润报表、班组评分与督导复盘。
 
+    骑手提前到店等待责任拆分：记录平台实际派单/改配、骑手到店/离店再到店、门店开始制作、
+    出杯、封签与交接时间，以及到店时排队杯量与爆单保护状态；按可配置阈值把等待拆为
+    平台派单过早 / 门店制作超时 / 骑手提前到店三段（宽限与豁免单列），整版换版可红冲，
+    重做/改配/离店再到店自动按时间线重归因、不重复计入；店长可申诉、区域经理复核后改判，
+    自动回算门店时效、骑手等待补贴、平台服务指标与班组评分，并永久保留原始归因与改判依据；
+    已取消/已交接订单的申诉只调整绩效结算，不改写订单交接事实。
+
 
     鉴权：所有 /v1 接口（除 /v1/auth/login）需要 `X-Staff-Code: <工号>` 请求头，
     或先登录后使用 `Authorization: Bearer <token>`。
@@ -138,6 +145,87 @@ paths:
                 store_fault: {type: boolean, description: 是否门店责任（如出杯超时导致取消）}
       responses:
         '200': {description: 已取消}
+  /v1/platform/orders/{id}/dispatch:
+    post:
+      tags: [platform]
+      summary: 平台实际派单/改配（同一订单第二次调用即改配；等待归因只认最新派单锚点，历史派单保留审计）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [eta]
+              properties:
+                rider_name: {type: string}
+                rider_code: {type: string, description: 骑手工号（绑定骑手账号，如 4001）}
+                eta: {type: string, format: date-time, description: 承诺骑手的预计到店时间}
+                occurred_at: {type: string, format: date-time, description: 平台回传派单/改配实际发生时间，缺省当前时间}
+                note: {type: string}
+      responses:
+        '201': {description: 已记录派单/改配}
+        '409': {description: 订单已交接/取消}
+  /v1/orders/{id}/wait-attribution:
+    get:
+      tags: [orders]
+      summary: 骑手到店等待三段归因（平台派单过早/门店制作超时/骑手提前到店；未结账为 provisional 实时试算）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK，含段明细、阈值/时间线快照、申诉复核记录}
+  /v1/orders/{id}/wait-attribution/recompute:
+    post:
+      tags: [management]
+      summary: 按最新事件时间线手动重新归因（整版换版；旧补贴红冲后重结，不重复计入）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+  /v1/orders/{id}/wait-appeals:
+    post:
+      tags: [management]
+      summary: 店长对等待归因发起申诉（machine_fault/temp_shortage/surge_force_majeure/other），待区域经理复核
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason_code]
+              properties:
+                reason_code: {type: string, enum: [machine_fault, temp_shortage, surge_force_majeure, other]}
+                reason_detail: {type: string}
+                evidence: {type: object, additionalProperties: true, description: 维修单号/照片/断电记录等}
+      responses:
+        '201': {description: 申诉已提交待复核}
+        '409': {description: 无等待记录/已有待复核申诉}
+  /v1/wait-reviews:
+    get:
+      tags: [management]
+      summary: 等待争议申诉列表（可按 status/store_id 过滤；店长仅本门店）
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [pending, approved, rejected]}}
+        - {name: store_id, in: query, schema: {type: integer}}
+      responses:
+        '200': {description: OK，含改判前后归因与指标快照}
+  /v1/wait-reviews/{id}/decision:
+    post:
+      tags: [management]
+      summary: 区域经理复核（approve/reject）；通过即自动回算门店时效/骑手补贴/平台指标/班组评分，保留原始归因与依据
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: {type: string, enum: [approve, reject]}
+                review_note: {type: string}
+      responses:
+        '200': {description: OK，handoff_fact_unchanged=true 表示不改写订单交接事实}
+        '409': {description: 申诉已复核}
   /v1/orders/{id}:
     get:
       tags: [orders]
@@ -354,6 +442,24 @@ paths:
                 rider_name: {type: string}
       responses:
         '200': {description: OK}
+  /v1/rider/leaves:
+    post:
+      tags: [rider]
+      summary: 骑手离店（再去取其他单等）；再次到店登记生成新区间，等待按区间独立归因、不重复计入
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id]
+              properties:
+                order_id: {type: integer}
+                reason: {type: string, example: other_order}
+                note: {type: string}
+      responses:
+        '200': {description: 已登记离店}
+        '409': {description: 没有进行中的到店记录/订单已结束}
   /v1/rider/arrivals/{id}:
     get:
       tags: [rider]
@@ -464,6 +570,41 @@ paths:
         - {name: to, in: query, schema: {type: string, format: date}}
       responses:
         '200': {description: OK}
+  /v1/reports/platform-service:
+    get:
+      tags: [management]
+      summary: 平台服务指标（按平台/门店汇总派单过早等待秒数、平台承担骑手等待补贴；平台账号只看本平台）
+      parameters:
+        - {name: platform, in: query, schema: {type: string, enum: [eleme, meituan]}}
+        - {name: from, in: query, schema: {type: string, format: date}}
+        - {name: to, in: query, schema: {type: string, format: date}}
+      responses:
+        '200': {description: OK}
+  /v1/management/wait-thresholds:
+    get:
+      tags: [management]
+      summary: 等待归因可配置阈值列表（store_id=0 为全局默认，正整数为门店覆盖）
+      responses:
+        '200': {description: OK}
+    put:
+      tags: [management]
+      summary: 调整等待归因阈值（派单前置秒数/门店出杯宽限/骑手早到宽限/补贴单价/评分扣分秒数）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [store_id]
+              properties:
+                store_id: {type: integer, description: 0=全局默认，正整数=门店覆盖}
+                platform_dispatch_lead_seconds: {type: integer, example: 600}
+                store_make_grace_seconds: {type: integer, example: 60}
+                rider_early_grace_seconds: {type: integer, example: 60}
+                rider_subsidy_per_minute: {type: number, example: 0.5}
+                store_wait_score_seconds: {type: integer, example: 300}
+      responses:
+        '200': {description: OK，仅影响调整后新计算的归因版本，历史版本参数快照永久保留}
   /v1/management/stores/{id}/team-score/refresh:
     post:
       tags: [management]

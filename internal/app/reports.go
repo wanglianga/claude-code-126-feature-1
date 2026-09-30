@@ -290,6 +290,15 @@ func (a *App) storeSummary(w http.ResponseWriter, r *http.Request) {
 		P90MakeSeconds    float64 `json:"p90_make_seconds"`
 		SlowOrders        int     `json:"slow_orders"`
 		RiderWaitStoreSec int     `json:"store_fault_wait_seconds"`
+		WaitTotalSec      int     `json:"rider_wait_total_seconds"`
+		WaitPlatformSec   int     `json:"wait_platform_early_dispatch_seconds"`
+		WaitStoreSec      int     `json:"wait_store_make_timeout_seconds"`
+		WaitRiderSec      int     `json:"wait_rider_early_arrival_seconds"`
+		WaitExemptedSec   int     `json:"wait_exempted_seconds"`
+		WaitFaultOrders   int     `json:"store_wait_fault_orders"`
+		RiderSubsidyTotal float64 `json:"rider_wait_subsidy_total"`
+		RiderSubsidyStore float64 `json:"rider_wait_subsidy_store"`
+		RiderSubsidyPlat  float64 `json:"rider_wait_subsidy_platform"`
 		WrongCups         int     `json:"wrong_cups"`
 		MissingStraw      int     `json:"missing_straw"`
 		MissingUtensil    int     `json:"missing_utensil"`
@@ -314,6 +323,9 @@ func (a *App) storeSummary(w http.ResponseWriter, r *http.Request) {
 		  SELECT * FROM exceptions WHERE store_id=$1 AND created_at::date BETWEEN $2 AND $3
 		), fin AS (
 		  SELECT * FROM finance_records WHERE store_id=$1 AND period_date BETWEEN $2 AND $3
+		), wa AS (
+		  SELECT w.* FROM wait_attributions w JOIN orders o ON o.id=w.order_id
+		  WHERE w.store_id=$1 AND w.status='active' AND o.ordered_at::date BETWEEN $2 AND $3
 		)
 		SELECT
 		  (SELECT count(*) FROM ord),
@@ -327,8 +339,19 @@ func (a *App) storeSummary(w http.ResponseWriter, r *http.Request) {
 		    FROM ord WHERE all_sealed_at IS NOT NULL),0),
 		  (SELECT count(*) FROM ord WHERE all_sealed_at IS NOT NULL
 		    AND all_sealed_at > ordered_at + make_interval(mins => promised_minutes)),
-		  COALESCE((SELECT sum(store_fault_wait_seconds) FROM rider_arrivals
-		    WHERE store_id=$1 AND arrived_at::date BETWEEN $2 AND $3),0),
+		  COALESCE((SELECT sum(store_seconds) FROM wa),0),
+		  COALESCE((SELECT sum(total_wait_seconds) FROM wa),0),
+		  COALESCE((SELECT sum(platform_seconds) FROM wa),0),
+		  COALESCE((SELECT sum(store_seconds) FROM wa),0),
+		  COALESCE((SELECT sum(rider_seconds) FROM wa),0),
+		  COALESCE((SELECT sum(exempted_seconds) FROM wa),0),
+		  (SELECT count(*) FROM wa WHERE store_seconds>0),
+		  COALESCE((SELECT sum(amount) FROM fin WHERE kind='rider_wait_subsidy'
+		    AND reversal_of IS NULL AND attribution_id IN (SELECT id FROM wa)),0),
+		  COALESCE((SELECT sum(amount) FROM fin WHERE kind='rider_wait_subsidy' AND bearer='store'
+		    AND reversal_of IS NULL AND attribution_id IN (SELECT id FROM wa)),0),
+		  COALESCE((SELECT sum(amount) FROM fin WHERE kind='rider_wait_subsidy' AND bearer='platform'
+		    AND reversal_of IS NULL AND attribution_id IN (SELECT id FROM wa)),0),
 		  (SELECT count(*) FROM exc WHERE type='wrong_cup'),
 		  (SELECT count(*) FROM exc WHERE type='missing_straw'),
 		  (SELECT count(*) FROM exc WHERE type='missing_utensil'),
@@ -349,6 +372,8 @@ func (a *App) storeSummary(w http.ResponseWriter, r *http.Request) {
 		`, storeID, from, to).Scan(
 		&m.OrdersReceived, &m.OrdersHanded, &m.OrdersCanceled, &m.StoreFaultCancel,
 		&m.AvgMakeSeconds, &m.P90MakeSeconds, &m.SlowOrders, &m.RiderWaitStoreSec,
+		&m.WaitTotalSec, &m.WaitPlatformSec, &m.WaitStoreSec, &m.WaitRiderSec, &m.WaitExemptedSec,
+		&m.WaitFaultOrders, &m.RiderSubsidyTotal, &m.RiderSubsidyStore, &m.RiderSubsidyPlat,
 		&m.WrongCups, &m.MissingStraw, &m.MissingUtensil, &m.WrongBags, &m.Remakes,
 		&m.RemakeCost, &m.LeakComplaints, &m.FoodOOS, &m.NoteMissed, &m.Stale,
 		&m.Revenue, &m.Refunds, &m.CustomerComp, &m.PlatformComp, &m.LossCost, &m.NetProfitImpact)
@@ -443,6 +468,7 @@ func computeScore(m map[string]int) (int, map[string]int) {
 	score -= m["stale"] * 3
 	score -= m["note_missed"] * 2
 	score -= m["store_cancel"] * 5
+	score -= m["wait_pen"] // 骑手等待中门店制作超时累计扣分（每阈值秒数扣 1，阈值可配）
 	if score < 0 {
 		score = 0
 	}
@@ -455,6 +481,7 @@ func computeScore(m map[string]int) (int, map[string]int) {
 	penalty["stale_penalty"] = m["stale"] * 3
 	penalty["note_missed_penalty"] = m["note_missed"] * 2
 	penalty["store_cancel_penalty"] = m["store_cancel"] * 5
+	penalty["rider_wait_store_penalty"] = m["wait_pen"]
 	return score, penalty
 }
 
@@ -462,51 +489,27 @@ func (a *App) refreshScore(w http.ResponseWriter, r *http.Request) {
 	storeID := toInt64(chi.URLParam(r, "id"))
 	day := time.Now().Format("2006-01-02")
 	ctx := r.Context()
-	var counts map[string]int
-	var remakeCost float64
-	rows, err := a.Pool.Query(ctx, `
-		SELECT 'orders', count(*) FROM orders WHERE store_id=$1 AND ordered_at::date=$2
-		UNION ALL SELECT 'slow', count(*) FROM orders WHERE store_id=$1 AND ordered_at::date=$2
-		  AND all_sealed_at IS NOT NULL AND all_sealed_at > ordered_at + make_interval(mins => promised_minutes)
-		UNION ALL SELECT 'wrong_cup', count(*) FROM exceptions WHERE store_id=$1 AND type='wrong_cup' AND created_at::date=$2
-		UNION ALL SELECT 'missing', count(*) FROM exceptions WHERE store_id=$1 AND type IN ('missing_straw','missing_utensil') AND created_at::date=$2
-		UNION ALL SELECT 'wrong_bag', count(*) FROM exceptions WHERE store_id=$1 AND type='wrong_bag' AND created_at::date=$2
-		UNION ALL SELECT 'stale', count(*) FROM exceptions WHERE store_id=$1 AND type='stale_drink' AND created_at::date=$2
-		UNION ALL SELECT 'note_missed', count(*) FROM exceptions WHERE store_id=$1 AND type='note_missed' AND created_at::date=$2
-		UNION ALL SELECT 'store_cancel', count(*) FROM orders WHERE store_id=$1 AND status='canceled' AND cancel_store_fault AND canceled_at::date=$2`,
-		storeID, day)
+	tx, err := a.Pool.Begin(ctx)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	counts = map[string]int{}
-	for rows.Next() {
-		var k string
-		var v int
-		_ = rows.Scan(&k, &v)
-		counts[k] = v
-	}
-	rows.Close()
-	_ = a.Pool.QueryRow(ctx,
-		`SELECT COALESCE(sum(amount),0)::float8 FROM finance_records
-		 WHERE store_id=$1 AND kind='remake_cost' AND period_date=$2`, storeID, day).Scan(&remakeCost)
-
-	score, penalty := computeScore(counts)
-	metrics := map[string]any{
-		"counts": counts, "penalties": penalty, "remake_cost": remakeCost, "date": day,
-	}
-	var id int64
-	err = a.Pool.QueryRow(ctx, `
-		INSERT INTO team_score_snapshots(store_id,score_date,metrics,score)
-		VALUES($1,$2,$3,$4)
-		ON CONFLICT (store_id,score_date) DO UPDATE SET metrics=$3,score=$4,updated_at=now()
-		RETURNING id`, storeID, day, metrics, score).Scan(&id)
+	defer tx.Rollback(ctx)
+	score, metrics, err := a.refreshTeamScoreTx(ctx, tx, storeID, day)
 	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var remakeCost float64
+	if v, ok := metrics["remake_cost"].(float64); ok {
+		remakeCost = v
+	}
+	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{
-		"id": id, "store_id": storeID, "score_date": day, "score": score,
+		"store_id": storeID, "score_date": day, "score": score,
 		"metrics": metrics, "remake_cost": remakeCost,
 	})
 }

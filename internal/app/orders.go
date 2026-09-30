@@ -788,6 +788,19 @@ func (a *App) cancelOrder(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// 骑手已有到店等待：取消时对等待三段归因定稿并结算补贴（仅结算，不改交接事实）
+	var arrivalN int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM rider_arrivals WHERE order_id=$1`, id).Scan(&arrivalN); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if arrivalN > 0 {
+		if _, _, _, _, _, err := a.persistWaitAttribution(ctx, tx, id, "initial", nil, ac.ID); err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, err)
 		return

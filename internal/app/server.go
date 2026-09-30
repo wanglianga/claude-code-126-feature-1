@@ -167,7 +167,7 @@ func (a *App) logEvent(ctx context.Context, tx pgx.Tx, orderID int64, etype stri
 	}
 	_, err := tx.Exec(ctx,
 		`INSERT INTO order_events(order_id,event_type,actor_role,actor_id,actor_name,detail)
-		 VALUES($1,$2,$3,$4,$5,$6)`, orderID, etype, role, id, name, detail)
+		 VALUES($1,$2,$3::text,$4::bigint,$5::text,$6)`, orderID, etype, role, id, name, detail)
 	return err
 }
 
@@ -222,6 +222,23 @@ func (a *App) Router() http.Handler {
 			// 平台 / 门店接单
 			r.With(require("platform", "store_manager")).Post("/platform/orders", a.intakeOrder)
 			r.With(require("platform", "platform_cs")).Post("/platform/orders/{id}/cancel", a.cancelOrder)
+			// 平台实际派单 / 改配（骑手等待归因锚点）
+			r.With(require("platform")).Post("/platform/orders/{id}/dispatch", a.dispatchOrder)
+
+			// 骑手等待三段归因与争议复核
+			r.Get("/orders/{id}/wait-attribution", a.getWaitAttribution)
+			r.With(require("area_manager", "supervisor", "finance", "store_manager")).
+				Post("/orders/{id}/wait-attribution/recompute", a.recomputeWait)
+			r.With(require("store_manager")).Post("/orders/{id}/wait-appeals", a.createWaitAppeal)
+			r.With(require("area_manager", "supervisor", "store_manager")).
+				Get("/wait-reviews", a.listWaitReviews)
+			r.With(require("area_manager")).Post("/wait-reviews/{id}/decision", a.decideWaitReview)
+			r.With(require("area_manager", "supervisor", "finance", "platform", "platform_cs")).
+				Get("/reports/platform-service", a.platformServiceReport)
+			r.With(require("admin", "area_manager", "store_manager")).
+				Get("/management/wait-thresholds", a.listWaitThresholds)
+			r.With(require("admin", "area_manager", "store_manager")).
+				Put("/management/wait-thresholds", a.updateWaitThresholds)
 
 			// 门店作业
 			r.With(require("store_manager", "barista")).Post("/staff/merge", a.mergeOrders)
@@ -241,6 +258,7 @@ func (a *App) Router() http.Handler {
 
 			// 骑手
 			r.With(require("rider")).Post("/rider/arrivals", a.riderArrive)
+			r.With(require("rider")).Post("/rider/leaves", a.riderLeave)
 			r.Get("/rider/arrivals/{id}", a.getArrival)
 			r.Get("/rider/screen", a.riderScreen)
 			r.With(require("rider", "store_manager", "barista")).Post("/rider/handoffs", a.handoff)

@@ -286,7 +286,7 @@ SCORE=$(J .score)
 [ "$SCORE" -lt 100 ] && ok "班组评分因异常扣分 (<100, 实际 $SCORE)" || bad "评分未扣分 $SCORE"
 api GET /v1/management/team-scores 1001 > /tmp/cc126/last.json
 [ "$(J 'length')" = "1" ] && ok "班组评分榜可查" || bad "评分榜"
-RC=$(api_code POST /v1/management/stores/1/reviews 1002 '{"from":"2026-09-01","to":"2026-09-29","summary":"午高峰出杯慢、漏餐具集中，加强封签核对","actions":["高峰加派1人","出杯叫号培训"]}')
+RC=$(api_code POST /v1/management/stores/1/reviews 1002 '{"from":"2026-09-01","to":"2030-12-31","summary":"午高峰出杯慢、漏餐具集中，加强封签核对","actions":["高峰加派1人","出杯叫号培训"]}')
 expect_code 201 "督导复盘创建"
 jq -e '.remake_cost_total < 0' /tmp/cc126/last.json >/dev/null && ok "重做成本计入复盘 ($(J .remake_cost_total))" || bad "复盘重做成本"
 
@@ -297,6 +297,159 @@ echo "  订单1出现的角色: $ROLES"
 for role in platform barista rider customer finance; do
   echo "$ROLES" | grep -q "$role" && ok "时间线含 $role" || bad "时间线缺 $role"
 done
+
+echo
+echo "== 20. 等待三段归因阈值配置 =="
+RC=$(api_code PUT /v1/management/wait-thresholds 1001 '{"store_id":1,"platform_dispatch_lead_seconds":900,"store_make_grace_seconds":60,"rider_early_grace_seconds":60,"rider_subsidy_per_minute":0.5,"store_wait_score_seconds":300}')
+expect_code 200 "门店1等待归因阈值配置"
+[ "$(J '.thresholds.platform_dispatch_lead_seconds')" = "900" ] && ok "派单前置阈值=900秒" || bad "阈值未生效"
+api GET /v1/management/wait-thresholds 0000 > /tmp/cc126/last.json
+[ "$(J '[.thresholds[]|select(.store_id==0)]|length')" = "1" ] && ok "全局默认阈值存在" || bad "无全局阈值"
+RC=$(api_code GET /v1/management/wait-thresholds 4001); expect_code 403 "骑手不能看阈值配置"
+
+echo "== 21. 派单过早+骑手提前+门店超时：等待三段拆分 =="
+BODYW1='{"platform_order_no":"EM-WAIT-1","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}'
+RC=$(api_code POST /v1/platform/orders 9001 "$BODYW1"); expect_code 201 "等待单W1接单"
+save w1; W1=$(getf .id w1)
+RC=$(api_code POST "/v1/platform/orders/$W1/dispatch" 9001 '{"rider_code":"4001","eta":"2026-09-15T12:10:00+08:00","occurred_at":"2026-09-15T12:00:00+08:00"}')
+expect_code 201 "W1平台派单记录"
+[ "$(J .event_type)" = "dispatched" ] && ok "首次为 dispatched" || bad "派单类型"
+$PSQL -c "UPDATE orders SET ordered_at='2026-09-15 12:00:00+08' WHERE id=$W1" >/dev/null
+RC=$(api_code POST /v1/rider/arrivals 4001 "{\"order_id\":$W1}"); expect_code 200 "W1骑手到店"
+$PSQL -c "UPDATE rider_arrivals SET arrived_at='2026-09-15 12:05:00+08' WHERE order_id=$W1 AND arrival_no=1" >/dev/null
+api GET "/v1/orders/$W1/wait-attribution" 0000 > /tmp/cc126/last.json
+[ "$(J .provisional)" = "true" ] && ok "交接前为 provisional 实时试算" || bad "试算标记"
+WCUP=$(api GET "/v1/orders/$W1" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$WCUP/start" 3001 >/dev/null
+api POST "/v1/staff/cups/$WCUP/seal" 3001 >/dev/null
+$PSQL -c "UPDATE orders SET all_sealed_at='2026-09-15 12:18:00+08' WHERE id=$W1" >/dev/null
+$PSQL -c "UPDATE order_cups SET started_at='2026-09-15 12:02:00+08',sealed_at='2026-09-15 12:18:00+08' WHERE order_id=$W1" >/dev/null
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$W1,\"actual_bags\":1,\"actual_hot\":1}")
+expect_code 200 "W1交接并完成等待归因"
+[ "$(J '.wait.rider_early_arrival_seconds')" = "240" ] && ok "骑手提前到店段=240秒(12:05→12:09)" || bad "骑手段 $(cat /tmp/cc126/last.json|jq -c .wait)"
+[ "$(J '.wait.platform_early_dispatch_seconds')" = "240" ] && ok "平台派单过早段=240秒(12:11→12:15)" || bad "平台段"
+[ "$(J '.wait.store_make_timeout_seconds')" = "180" ] && ok "门店制作超时段=180秒(12:15→12:18)" || bad "门店段"
+[ "$(J '.wait.rider_subsidy_store')" = "1.5" ] && ok "门店承担等待补贴1.50元" || bad "门店补贴 $(J '.wait.rider_subsidy_store')"
+[ "$(J '.wait.rider_subsidy_platform')" = "2" ] && ok "平台承担等待补贴2.00元" || bad "平台补贴 $(J '.wait.rider_subsidy_platform')"
+api GET "/v1/orders/$W1/wait-attribution" 0000 > /tmp/cc126/last.json
+[ "$(J '[.segments[]|.segment_type]|unique|length')" -ge 3 ] && ok "段明细多类型可查且互不重叠" || bad "段明细"
+[ "$(J '[.segments[].seconds]|add')" = "$(J '.segments[].seconds' | awk '{s+=$1}END{print s}')" ] && ok "段秒数合计自洽" || bad "段秒数合计"
+
+echo "== 22. 离店再到店：区间独立归因、空档不计、不重复 =="
+BODYW2='{"platform_order_no":"EM-WAIT-2","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}'
+RC=$(api_code POST /v1/platform/orders 9001 "$BODYW2"); expect_code 201 "等待单W2接单"
+save w2; W2=$(getf .id w2)
+api POST "/v1/platform/orders/$W2/dispatch" 9001 '{"rider_code":"4001","eta":"2026-09-15T12:10:00+08:00","occurred_at":"2026-09-15T12:00:00+08:00"}' >/dev/null
+$PSQL -c "UPDATE orders SET ordered_at='2026-09-15 12:00:00+08' WHERE id=$W2" >/dev/null
+api POST /v1/rider/arrivals 4001 "{\"order_id\":$W2}" >/dev/null
+$PSQL -c "UPDATE rider_arrivals SET arrived_at='2026-09-15 12:05:00+08' WHERE order_id=$W2 AND arrival_no=1" >/dev/null
+RC=$(api_code POST /v1/rider/leaves 4001 '{"order_id":'$W2',"reason":"other_order","note":"先取隔壁单"}')
+expect_code 200 "W2骑手第一次离店"
+$PSQL -c "UPDATE rider_arrivals SET left_at='2026-09-15 12:07:00+08' WHERE order_id=$W2 AND arrival_no=1" >/dev/null
+api GET "/v1/rider/screen?store_id=1" 4001 > /tmp/cc126/last.json
+[ "$(J "map(select(.order_id==$W2))|length")" = "0" ] && ok "离店后从到店屏消失" || bad "到店屏未过滤离店: $(cat /tmp/cc126/last.json)"
+api POST /v1/rider/arrivals 4001 "{\"order_id\":$W2}" >/dev/null
+$PSQL -c "UPDATE rider_arrivals SET arrived_at='2026-09-15 12:12:00+08' WHERE order_id=$W2 AND arrival_no=2" >/dev/null
+WCUP2=$(api GET "/v1/orders/$W2" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$WCUP2/start" 3001 >/dev/null
+api POST "/v1/staff/cups/$WCUP2/seal" 3001 >/dev/null
+$PSQL -c "UPDATE orders SET all_sealed_at='2026-09-15 12:18:00+08' WHERE id=$W2" >/dev/null
+$PSQL -c "UPDATE order_cups SET started_at='2026-09-15 12:12:30+08',sealed_at='2026-09-15 12:18:00+08' WHERE order_id=$W2" >/dev/null
+api POST /v1/rider/handoffs 4001 "{\"order_id\":$W2,\"actual_bags\":1,\"actual_hot\":1}" >/dev/null
+api GET "/v1/orders/$W2/wait-attribution" 0000 > /tmp/cc126/last.json
+[ "$(J '.attribution.rider_early_arrival_seconds')" = "120" ] && ok "第一段骑手段=120秒(12:05→12:07)" || bad "W2骑手段"
+[ "$(J '.attribution.platform_early_dispatch_seconds')" = "180" ] && ok "第二段平台段=180秒(12:12→12:15)" || bad "W2平台段"
+[ "$(J '.attribution.store_make_timeout_seconds')" = "180" ] && ok "第二段门店段=180秒(12:15→12:18)" || bad "W2门店段"
+A1=$($PSQL -c "SELECT store_fault_wait_seconds FROM rider_arrivals WHERE order_id=$W2 AND arrival_no=1")
+A2=$($PSQL -c "SELECT store_fault_wait_seconds FROM rider_arrivals WHERE order_id=$W2 AND arrival_no=2")
+[ "$A1" = "0" ] && [ "$A2" = "180" ] && ok "门店责任只落第二段，离店空档不重复计入 ($A1/$A2)" || bad "两段责任 $A1/$A2"
+
+echo "== 23. 改配后按最新派单时间线重新归因 =="
+BODYW3='{"platform_order_no":"EM-WAIT-3","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}'
+RC=$(api_code POST /v1/platform/orders 9001 "$BODYW3"); expect_code 201 "等待单W3接单"
+save w3; W3=$(getf .id w3)
+api POST "/v1/platform/orders/$W3/dispatch" 9001 '{"rider_code":"4001","eta":"2026-09-15T12:20:00+08:00","occurred_at":"2026-09-15T11:50:00+08:00"}' >/dev/null
+$PSQL -c "UPDATE orders SET ordered_at='2026-09-15 11:50:00+08' WHERE id=$W3" >/dev/null
+api POST /v1/rider/arrivals 4001 "{\"order_id\":$W3}" >/dev/null
+$PSQL -c "UPDATE rider_arrivals SET arrived_at='2026-09-15 12:10:00+08' WHERE order_id=$W3 AND arrival_no=1" >/dev/null
+RC=$(api_code POST "/v1/platform/orders/$W3/dispatch" 9001 '{"rider_code":"4001","eta":"2026-09-15T12:16:00+08:00","occurred_at":"2026-09-15T12:14:00+08:00","note":"顾客改地址改配"}')
+expect_code 201 "W3平台改配"
+[ "$(J .event_type)" = "redispatch" ] && [ "$(J .seq)" = "2" ] && ok "第二次派单识别为改配 seq=2" || bad "改配类型"
+WCUP3=$(api GET "/v1/orders/$W3" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$WCUP3/start" 3001 >/dev/null
+api POST "/v1/staff/cups/$WCUP3/seal" 3001 >/dev/null
+$PSQL -c "UPDATE orders SET all_sealed_at='2026-09-15 12:18:00+08' WHERE id=$W3" >/dev/null
+$PSQL -c "UPDATE order_cups SET started_at='2026-09-15 12:14:30+08',sealed_at='2026-09-15 12:18:00+08' WHERE order_id=$W3" >/dev/null
+api POST /v1/rider/handoffs 4001 "{\"order_id\":$W3,\"actual_bags\":1,\"actual_hot\":1}" >/dev/null
+api GET "/v1/orders/$W3/wait-attribution" 0000 > /tmp/cc126/last.json
+[ "$(J '.attribution.platform_early_dispatch_seconds')" = "60" ] && ok "改配后平台段=60秒(12:17→12:18)" || bad "W3平台段 $(J .attribution.platform_early_dispatch_seconds)"
+[ "$(J '.attribution.store_make_timeout_seconds')" = "0" ] && ok "改配后门店段=0(改配过晚门店免责)" || bad "W3门店段"
+
+echo "== 24. 重做后按最终出杯时间一次归因（不重复计门店） =="
+BODYW4='{"platform_order_no":"EM-WAIT-4","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}'
+RC=$(api_code POST /v1/platform/orders 9001 "$BODYW4"); expect_code 201 "等待单W4接单"
+save w4; W4=$(getf .id w4)
+api POST "/v1/platform/orders/$W4/dispatch" 9001 '{"rider_code":"4001","eta":"2026-09-15T12:10:00+08:00","occurred_at":"2026-09-15T12:00:00+08:00"}' >/dev/null
+$PSQL -c "UPDATE orders SET ordered_at='2026-09-15 12:00:00+08' WHERE id=$W4" >/dev/null
+api POST /v1/rider/arrivals 4001 "{\"order_id\":$W4}" >/dev/null
+$PSQL -c "UPDATE rider_arrivals SET arrived_at='2026-09-15 12:05:00+08' WHERE order_id=$W4 AND arrival_no=1" >/dev/null
+OLD4=$(api GET "/v1/orders/$W4" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$OLD4/start" 3001 >/dev/null
+api POST "/v1/staff/cups/$OLD4/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET started_at='2026-09-15 12:02:00+08',sealed_at='2026-09-15 12:18:00+08' WHERE id=$OLD4" >/dev/null
+$PSQL -c "UPDATE orders SET all_sealed_at='2026-09-15 12:18:00+08' WHERE id=$W4" >/dev/null
+api POST "/v1/staff/cups/$OLD4/remake" 3001 '{"reason":"stale_drink","detail":{"waited_minutes":20}}' >/dev/null
+NEW4=$(api GET "/v1/orders/$W4" 0000 | jq -r '.cups|map(select(.status=="queued"))[0].id')
+api POST "/v1/staff/cups/$NEW4/start" 3001 >/dev/null
+api POST "/v1/staff/cups/$NEW4/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET started_at='2026-09-15 12:20:00+08',sealed_at='2026-09-15 12:25:00+08' WHERE id=$NEW4" >/dev/null
+$PSQL -c "UPDATE orders SET all_sealed_at='2026-09-15 12:25:00+08' WHERE id=$W4" >/dev/null
+api POST /v1/rider/handoffs 4001 "{\"order_id\":$W4,\"actual_bags\":1,\"actual_hot\":1}" >/dev/null
+api GET "/v1/orders/$W4/wait-attribution" 0000 > /tmp/cc126/last.json
+[ "$(J '.attribution.store_make_timeout_seconds')" = "600" ] && ok "重做后门店段按最终出杯=600秒(12:15→12:25)，不重复累计" || bad "W4门店段 $(J .attribution.store_make_timeout_seconds)"
+
+echo "== 25. 店长申诉→区域经理复核改判→自动回算且不改交接事实 =="
+RC=$(api_code POST "/v1/orders/$W1/wait-appeals" 4001 '{"reason_code":"machine_fault","reason_detail":"x"}')
+expect_code 403 "骑手不能发起门店申诉"
+RC=$(api_code POST "/v1/orders/$W1/wait-appeals" 2001 '{"reason_code":"machine_fault","reason_detail":"12:11咖啡机故障停机","evidence":{"repair_ticket":"R-1","photo":"ev.jpg"}}')
+expect_code 201 "店长机器故障申诉受理"
+RV=$(J .review_id)
+RC=$(api_code POST "/v1/orders/$W1/wait-appeals" 2001 '{"reason_code":"other","reason_detail":"重复申诉"}')
+expect_code 409 "待复核中重复申诉被拒"
+RC=$(api_code POST "/v1/wait-reviews/$RV/decision" 3001 '{"decision":"approve"}')
+expect_code 403 "店员不能复核申诉"
+RC=$(api_code POST "/v1/wait-reviews/$RV/decision" 1001 '{"decision":"approve","review_note":"维修工单与监控核实，门店豁免转平台"}')
+expect_code 200 "区域经理复核通过"
+[ "$(J .handoff_fact_unchanged)" = "true" ] && ok "改判声明不改交接事实" || bad "交接事实标记"
+[ "$(J .after.store_seconds)" = "0" ] && ok "改判后门店责任秒数归零" || bad "改判门店秒数"
+[ "$(J .after.exempted_seconds)" = "180" ] && ok "原门店180秒转豁免" || bad "豁免秒数 $(J .after.exempted_seconds)"
+[ "$(J .after.rider_subsidy_platform)" = "3.5" ] && ok "平台承担补贴改判为3.50元" || bad "改判平台补贴"
+SN=$($PSQL -c "SELECT COALESCE(sum(amount),0) FROM finance_records WHERE order_id=$W1 AND kind='rider_wait_subsidy' AND bearer='store'")
+PN=$($PSQL -c "SELECT COALESCE(sum(amount),0) FROM finance_records WHERE order_id=$W1 AND kind='rider_wait_subsidy' AND bearer='platform'")
+[ "$SN" = "0.00" ] && ok "门店补贴红冲后净额0.00 ($SN)" || bad "门店红冲净额 $SN"
+[ "$PN" = "-3.50" ] && ok "平台补贴净额-3.50 ($PN)" || bad "平台净额 $PN"
+$PSQL -c "SELECT status,store_seconds FROM wait_attributions WHERE order_id=$W1 ORDER BY version_no"
+[ "$($PSQL -c "SELECT status||'/'||store_seconds FROM wait_attributions WHERE order_id=$W1 AND version_no=1")" = "superseded/180" ] && ok "原始归因v1(superseded,门店180秒)保留" || bad "原始归因未保留"
+[ "$($PSQL -c "SELECT count(*) FROM wait_segments s JOIN wait_attributions w ON w.id=s.attribution_id WHERE w.order_id=$W1 AND w.version_no=1")" -ge 1 ] && ok "v1原始拆分段永久保留" || bad "v1段丢失"
+api GET "/v1/orders/$W1" 0000 > /tmp/cc126/last.json
+[ "$(J .status)" = "handed" ] && ok "订单仍为 handed，交接事实未被改写" || bad "订单状态被改 $(J .status)"
+[ "$($PSQL -c "SELECT count(*) FROM handoffs WHERE order_id=$W1 AND passed=TRUE")" = "1" ] && ok "交接核验记录保留1条" || bad "交接记录被改"
+api POST /v1/management/stores/1/team-score/refresh 1002 >/dev/null
+api GET /v1/management/team-scores 1001 > /tmp/cc126/last.json
+[ "$(J 'length')" -ge 1 ] && ok "改判后班组评分榜可刷新" || bad "评分榜"
+api GET "/v1/wait-reviews?status=approved" 1001 > /tmp/cc126/last.json
+[ "$(J "[.[]|select(.id==$RV and .status==\"approved\")]|length")" = "1" ] && ok "复核单含改判前后指标快照可查" || bad "复核单查询"
+
+echo "== 26. 平台服务指标（派单过早口径） =="
+api GET "/v1/reports/platform-service?from=2026-09-01&to=2030-12-31&platform=eleme" 1001 > /tmp/cc126/last.json
+[ "$(J '.total.platform_fault_orders')" -ge 2 ] && ok "平台指标统计到派单过早/豁免订单" || bad "平台指标 $(J .total)"
+[ "$(J '[.stores[]|select(.platform=="eleme")]|length')" -ge 1 ] && ok "按平台+门店分组返回" || bad "平台分组"
+RC=$(api_code GET "/v1/reports/platform-service" 4002); expect_code 403 "骑手不能查平台服务指标"
+RC=$(api_code GET "/v1/reports/platform-service" 5002); expect_code 200 "美团客服可查（自动限定美团口径）"
+api GET "/v1/reports/stores/1/summary?from=2026-09-01&to=2030-12-31" 1001 > /tmp/cc126/last.json
+[ "$(J '.metrics.wait_platform_early_dispatch_seconds')" -ge 240 ] && ok "门店报表含平台派单过早秒数" || bad "门店报表等待口径"
+[ "$(J '.metrics.wait_exempted_seconds')" = "180" ] && ok "门店报表含复核豁免180秒" || bad "门店报表豁免 $(J '.metrics.wait_exempted_seconds')"
+[ "$(J '.metrics.rider_wait_subsidy_platform')" != "0" ] && ok "门店报表含平台承担等待补贴" || bad "门店报表补贴"
 
 echo
 echo "================ 结果: PASS=$PASS FAIL=$FAIL ================"
