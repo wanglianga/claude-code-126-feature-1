@@ -222,6 +222,8 @@ func (a *App) Router() http.Handler {
 			// 平台 / 门店接单
 			r.With(require("platform", "store_manager")).Post("/platform/orders", a.intakeOrder)
 			r.With(require("platform", "platform_cs")).Post("/platform/orders/{id}/cancel", a.cancelOrder)
+			// 改配（实际派单时间线更新，自动重归因）
+			r.With(require("platform", "platform_cs")).Post("/platform/orders/{id}/redispatch", a.redispatchOrder)
 
 			// 门店作业
 			r.With(require("store_manager", "barista")).Post("/staff/merge", a.mergeOrders)
@@ -241,9 +243,25 @@ func (a *App) Router() http.Handler {
 
 			// 骑手
 			r.With(require("rider")).Post("/rider/arrivals", a.riderArrive)
+			r.With(require("rider", "store_manager", "barista")).Post("/rider/arrivals/{id}/leave", a.riderLeave)
 			r.Get("/rider/arrivals/{id}", a.getArrival)
 			r.Get("/rider/screen", a.riderScreen)
 			r.With(require("rider", "store_manager", "barista")).Post("/rider/handoffs", a.handoff)
+
+			// 骑手提前到店：等待三段归因与阈值配置
+			r.Get("/orders/{id}/wait-attribution", a.getWaitAttribution)
+			r.With(require("store_manager", "area_manager", "admin")).
+				Get("/stores/{id}/wait-thresholds", a.getWaitThresholds)
+			r.With(require("store_manager", "area_manager", "admin")).
+				Patch("/stores/{id}/wait-thresholds", a.updateWaitThresholds)
+
+			// 店长申诉 → 区域经理复核（改判自动回算时效/补贴/平台指标/班组评分）
+			r.With(require("store_manager", "admin")).
+				Post("/orders/{id}/wait-appeals", a.createWaitAppeal)
+			r.With(require("store_manager", "area_manager", "supervisor", "admin")).
+				Get("/stores/{id}/wait-appeals", a.listWaitAppeals)
+			r.With(require("area_manager", "admin")).
+				Post("/wait-appeals/{id}/review", a.reviewWaitAppeal)
 
 			// 顾客 / 客服
 			r.With(require("customer", "platform_cs", "finance")).Post("/customers/orders/{id}/complain", a.complain)

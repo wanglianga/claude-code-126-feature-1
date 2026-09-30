@@ -368,12 +368,12 @@ func (a *App) intakeOrder(w http.ResponseWriter, r *http.Request) {
 		total = *req.TotalAmount
 	}
 
-	// 建单
+	// 建单（平台推单即记录实际派单时间；改配以 /v1/platform/orders/{id}/redispatch 更新）
 	var orderID int64
 	if err := tx.QueryRow(ctx,
 		`INSERT INTO orders(platform,platform_order_no,store_id,customer_id,customer_note,
-			total_amount,promised_minutes,rider_eta,created_by)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+			total_amount,promised_minutes,rider_eta,dispatched_at,created_by)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,now(),$9) RETURNING id`,
 		req.Platform, req.PlatformOrderNo, store.ID, req.CustomerID, req.CustomerNote,
 		total, req.PromisedMinutes, req.RiderETA, ac.ID).Scan(&orderID); err != nil {
 		writeErr(w, err)
@@ -524,7 +524,7 @@ func scanOrder(row pgx.Row) (*Order, error) {
 	var o Order
 	err := row.Scan(&o.ID, &o.Platform, &o.PlatformOrderNo, &o.StoreID, &o.Status,
 		&o.CustomerID, &o.CustomerNote, &o.TotalAmount, &o.PromisedMinutes, &o.OrderedAt,
-		&o.RiderETA, &o.AllSealedAt, &o.HandedAt, &o.CanceledAt, &o.CancelReason, &o.MergedGroupID)
+		&o.DispatchedAt, &o.RiderETA, &o.AllSealedAt, &o.HandedAt, &o.CanceledAt, &o.CancelReason, &o.MergedGroupID)
 	if err != nil {
 		return nil, err
 	}
@@ -532,7 +532,7 @@ func scanOrder(row pgx.Row) (*Order, error) {
 }
 
 const orderCols = `id,platform,platform_order_no,store_id,status,COALESCE(customer_id,''),COALESCE(customer_note,''),
- total_amount,promised_minutes,ordered_at,rider_eta,all_sealed_at,handed_at,canceled_at,COALESCE(cancel_reason,''),merged_group_id`
+ total_amount,promised_minutes,ordered_at,dispatched_at,rider_eta,all_sealed_at,handed_at,canceled_at,COALESCE(cancel_reason,''),merged_group_id`
 
 func (a *App) loadOrder(ctx context.Context, id int64) (*Order, error) {
 	o, err := scanOrder(a.Pool.QueryRow(ctx, "SELECT "+orderCols+" FROM orders WHERE id=$1", id))
@@ -787,6 +787,24 @@ func (a *App) cancelOrder(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		writeErr(w, err)
 		return
+	}
+	// 骑手已到店的，取消即按取消时刻收口等待并做最终归因（后续申诉仅调整绩效结算）
+	var visited int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM rider_arrivals WHERE order_id=$1`, id).Scan(&visited); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if visited > 0 {
+		if _, err := tx.Exec(ctx,
+			`UPDATE rider_arrivals SET left_at=COALESCE(left_at,now())
+			 WHERE order_id=$1 AND handed_at IS NULL AND left_at IS NULL`, id); err != nil {
+			writeErr(w, err)
+			return
+		}
+		if _, err := a.recomputeWaitAttribution(ctx, tx, id, "canceled", nil, ac.ID); err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, err)

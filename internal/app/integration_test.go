@@ -362,3 +362,163 @@ func TestReportAndTeamScore(t *testing.T) {
 }
 
 var _ = strings.TrimSpace
+
+// 骑手提前到店等待三段拆分 + 店长申诉 + 区域经理复核改判回算
+func TestWaitAttributionSplitAndAppealReview(t *testing.T) {
+	// 1) 门店阈值：制作目标 1 秒、补贴 1 元/分钟，便于确定性触发门店超时
+	sc, b := do(t, "PATCH", "/v1/stores/1/wait-thresholds", "2001",
+		map[string]any{"make_target_seconds": 1, "subsidy_per_minute": 1.0})
+	mustStatus(t, sc, 200, b)
+	if int(b["make_target_seconds"].(float64)) != 1 {
+		t.Fatalf("阈值未生效: %v", b)
+	}
+
+	// 2) 推单，骑手 ETA 在 30 分钟后（骑手必然提前到店）
+	eta := time.Now().Add(30 * time.Minute).Format(time.RFC3339)
+	sc, b = do(t, "POST", "/v1/platform/orders", "9001", intake("EM-WAIT-1", []intakeItem{
+		{"sku": "AM", "qty": 1, "temp": "hot", "sugar": "无糖", "cup_size": "M"},
+	}, map[string]any{"rider_eta": eta}))
+	mustStatus(t, sc, 201, b)
+	oid := int64(b["id"].(float64))
+	cid := int64(b["cups"].([]any)[0].(map[string]any)["id"].(float64))
+
+	// 3) 骑手提前到店：带排队杯量与爆单快照
+	sc, b = do(t, "POST", "/v1/rider/arrivals", "4001", map[string]any{"order_id": oid})
+	mustStatus(t, sc, 200, b)
+	ao := b["orders"].([]any)[0].(map[string]any)
+	if !ao["early"].(bool) {
+		t.Fatalf("应判定提前到店: %v", b)
+	}
+	if ao["queue_cups"].(float64) < 1 {
+		t.Fatalf("到店应记录排队杯量: %v", ao)
+	}
+	if ao["surge"] == nil {
+		t.Fatalf("到店应记录爆单状态快照: %v", ao)
+	}
+
+	// 4) 等待超过制作目标后制作出杯，再交接
+	time.Sleep(2100 * time.Millisecond)
+	sc, b = do(t, "POST", fmt.Sprintf("/v1/staff/cups/%d/start", cid), "3001", nil)
+	mustStatus(t, sc, 200, b)
+	sc, b = do(t, "POST", fmt.Sprintf("/v1/staff/cups/%d/seal", cid), "3001", nil)
+	mustStatus(t, sc, 200, b)
+	sc, b = do(t, "POST", "/v1/rider/handoffs", "4001",
+		map[string]any{"order_id": oid, "actual_bags": 1, "actual_hot": 1})
+	mustStatus(t, sc, 200, b)
+	split := b["wait_split_seconds"].(map[string]any)
+	for _, k := range []string{"rider_arrive_early", "platform_dispatch_early", "store_make_timeout", "waived"} {
+		if _, ok := split[k]; !ok {
+			t.Fatalf("交接结果缺少责任段 %s: %v", k, split)
+		}
+	}
+	// 制作目标仅 1s，门店制作超时应 ≥1 秒且产生门店承担的骑手等待补贴
+	if split["store_make_timeout"].(float64) < 1 {
+		t.Fatalf("应产生门店制作超时: %v", split)
+	}
+	subsidy := b["subsidy_by_party"].(map[string]any)
+	if _, ok := subsidy["store"]; !ok {
+		t.Fatalf("门店超时应有门店承担的骑手等待补贴: %v", subsidy)
+	}
+
+	// 5) 店长就机器故障发起申诉
+	sc, b = do(t, "POST", fmt.Sprintf("/v1/orders/%d/wait-appeals", oid), "2001", map[string]any{
+		"reason_code":   "machine_fault",
+		"reason_detail": "意式机故障停机，监控工单 FIX-X",
+		"evidence":      map[string]any{"ticket": "FIX-X"},
+	})
+	mustStatus(t, sc, 201, b)
+	if !b["settlement_only"].(bool) {
+		t.Fatalf("订单已交接，申诉应为结算-only: %v", b)
+	}
+	apid := int64(b["appeal_id"].(float64))
+
+	// 店员/骑手无权复核
+	if sc, _ := do(t, "POST", fmt.Sprintf("/v1/wait-appeals/%d/review", apid), "3001",
+		map[string]any{"decision": "approved", "move_to_party": "waived", "note": "x"}); sc != 403 {
+		t.Fatalf("店员复核应 403, got %d", sc)
+	}
+
+	// 6) 区域经理复核通过，门店超时段改判豁免
+	sc, b = do(t, "POST", fmt.Sprintf("/v1/wait-appeals/%d/review", apid), "1001", map[string]any{
+		"decision":      "approved",
+		"move_to_party": "waived",
+		"note":          "核实机器故障，非门店班组责任，改判豁免，平台承担骑手补贴",
+	})
+	mustStatus(t, sc, 200, b)
+	if !b["settlement_only"].(bool) {
+		t.Fatalf("复核结果应标记 settlement_only: %v", b)
+	}
+	newSplit := b["attribution"].(map[string]any)["summary_seconds"].(map[string]any)
+	if newSplit["store_make_timeout"].(float64) != 0 {
+		t.Fatalf("改判后门店制作超时应归零: %v", newSplit)
+	}
+	if newSplit["waived"].(float64) < 1 {
+		t.Fatalf("改判后应产生豁免段: %v", newSplit)
+	}
+
+	// 7) 交接事实不可改写
+	sc, b = do(t, "GET", fmt.Sprintf("/v1/orders/%d", oid), "0000", nil)
+	mustStatus(t, sc, 200, b)
+	if b["status"] != "handed" || b["handed_at"] == nil {
+		t.Fatalf("复核不得改写交接事实: %v", b)
+	}
+
+	// 8) 最新归因版本门店超时归零，原始版本仍保留
+	sc, b = do(t, "GET", fmt.Sprintf("/v1/orders/%d/wait-attribution", oid), "2001", nil)
+	mustStatus(t, sc, 200, b)
+	final := b["summary_seconds"].(map[string]any)
+	if final["store_make_timeout"].(float64) != 0 || final["waived"].(float64) < 1 {
+		t.Fatalf("最新归因应反映改判: %v", final)
+	}
+	hist := b["run_history"].([]any)
+	if len(hist) < 2 {
+		t.Fatalf("应保留多个归因版本（含原始交接版）: %v", hist)
+	}
+
+	// 9) 门店财务台账中门店承担的骑手等待补贴净额应被冲回为 0
+	sc, b = do(t, "GET", "/v1/stores/1/finance?from=2020-01-01&to=2030-01-01", "6001", nil)
+	mustStatus(t, sc, 200, b)
+	var storeSubNet float64
+	for _, row := range b["summary"].([]any) {
+		m := row.(map[string]any)
+		if m["kind"] == "rider_wait_subsidy" && m["bearer"] == "store" {
+			storeSubNet = m["amount"].(float64)
+		}
+	}
+	if storeSubNet != 0 {
+		t.Fatalf("改判后门店骑手等待补贴净额应为 0（冲回）, got %v", storeSubNet)
+	}
+}
+
+// 骑手离店后再到店应产生两条到店记录，等待区间不重叠、离店期间不计等待
+func TestRiderLeaveAndReturnCreatesNewArrival(t *testing.T) {
+	eta := time.Now().Add(30 * time.Minute).Format(time.RFC3339)
+	sc, b := do(t, "POST", "/v1/platform/orders", "9001", intake("EM-WAIT-2", []intakeItem{
+		{"sku": "AM", "qty": 1, "temp": "hot", "sugar": "无糖", "cup_size": "M"},
+	}, map[string]any{"rider_eta": eta}))
+	mustStatus(t, sc, 201, b)
+	oid := int64(b["id"].(float64))
+
+	sc, b = do(t, "POST", "/v1/rider/arrivals", "4001", map[string]any{"order_id": oid})
+	mustStatus(t, sc, 200, b)
+	a1 := int64(b["orders"].([]any)[0].(map[string]any)["arrival_id"].(float64))
+
+	sc, b = do(t, "POST", fmt.Sprintf("/v1/rider/arrivals/%d/leave", a1), "4001", nil)
+	mustStatus(t, sc, 200, b)
+	if b["left_at"] == nil {
+		t.Fatalf("离店应返回 left_at: %v", b)
+	}
+
+	sc, b = do(t, "POST", "/v1/rider/arrivals", "4001", map[string]any{"order_id": oid})
+	mustStatus(t, sc, 200, b)
+	a2 := int64(b["orders"].([]any)[0].(map[string]any)["arrival_id"].(float64))
+	if a2 == a1 {
+		t.Fatalf("离店后再到店应新开记录, a1=%d a2=%d", a1, a2)
+	}
+
+	var n int
+	if err := suite.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM rider_arrivals WHERE order_id=$1`, oid).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("应有 2 条到店记录, n=%d err=%v", n, err)
+	}
+}

@@ -383,6 +383,21 @@ func (a *App) sealCup(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, err)
 			return
 		}
+		// 有骑手在等时，出杯即重算一次等待归因（交接时做最终版）
+		var waiting int
+		if err := tx.QueryRow(ctx,
+			`SELECT count(*) FROM rider_arrivals
+			 WHERE order_id=$1 AND handed_at IS NULL AND left_at IS NULL`,
+			orderID).Scan(&waiting); err != nil {
+			writeErr(w, err)
+			return
+		}
+		if waiting > 0 {
+			if _, err := a.recomputeWaitAttribution(ctx, tx, orderID, "ready", nil, ac.ID); err != nil {
+				writeErr(w, err)
+				return
+			}
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, err)
@@ -584,6 +599,19 @@ func (a *App) remakeCup(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		writeErr(w, err)
 		return
+	}
+	// 有骑手到过店时，重做按事件时间线重新归因（旧杯出杯不再缩短等待，避免与新杯等待重复计入）
+	var visited int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM rider_arrivals WHERE order_id=$1`,
+		old.orderID).Scan(&visited); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if visited > 0 {
+		if _, err := a.recomputeWaitAttribution(ctx, tx, old.orderID, "remade", nil, ac.ID); err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, err)

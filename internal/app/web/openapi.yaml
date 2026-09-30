@@ -25,6 +25,7 @@ tags:
   - name: rider
   - name: customer
   - name: finance
+  - name: wait-attribution
   - name: management
 security:
   - StaffCode: []
@@ -138,6 +139,22 @@ paths:
                 store_fault: {type: boolean, description: 是否门店责任（如出杯超时导致取消）}
       responses:
         '200': {description: 已取消}
+  /v1/platform/orders/{id}/redispatch:
+    post:
+      tags: [platform]
+      summary: 改配/改派（更新实际派单时间线，收口原骑手等待区间并按事件时间线重新归因）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rider_name: {type: string, description: 改派后的骑手}
+                reason: {type: string, example: 原骑手车辆故障改派}
+      responses:
+        '200': {description: 已改配并重新归因}
+        '409': {description: 订单已交接/取消不可改派}
   /v1/orders/{id}:
     get:
       tags: [orders]
@@ -357,10 +374,18 @@ paths:
   /v1/rider/arrivals/{id}:
     get:
       tags: [rider]
-      summary: 到店记录（等待时长、门店责任等待时长）
+      summary: 到店记录（等待时长、门店责任等待时长、排队杯量/位序、爆单快照、三段拆分）
       parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
       responses:
         '200': {description: OK}
+  /v1/rider/arrivals/{id}/leave:
+    post:
+      tags: [rider]
+      summary: 骑手离店（离店再到店时另开到店记录；离店即收口等待区间并重归因）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: 已登记离店}
+        '409': {description: 已交接不可离店}
   /v1/rider/screen:
     get:
       tags: [rider]
@@ -401,6 +426,88 @@ paths:
                 properties:
                   passed: {type: boolean}
                   issues: {type: array, items: {type: string}}
+  /v1/orders/{id}/wait-attribution:
+    get:
+      tags: [wait-attribution]
+      summary: 骑手提前到店等待三段归因结果与历史版本（平台派单过早/门店制作超时/骑手提前到店/豁免）
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer}}
+        - {name: version, in: query, schema: {type: integer}, description: 指定历史版本，缺省最新}
+      responses:
+        '200': {description: OK}
+  /v1/orders/{id}/wait-appeals:
+    post:
+      tags: [wait-attribution]
+      summary: 店长对等待责任发起申诉（机器故障/临时缺货/人手不足/爆单连锁/其他），需区域经理复核
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason_code, reason_detail]
+              properties:
+                reason_code: {type: string, enum: [machine_fault, temp_shortage, staff_shortage, surge_knockon, other]}
+                reason_detail: {type: string, description: 故障/缺货情况与影响时段}
+                evidence: {type: object, additionalProperties: true, example: {ticket: FIX-77}}
+                window_from: {type: string, format: date-time, description: 申诉时间窗起（空=整单）}
+                window_to: {type: string, format: date-time, description: 申诉时间窗止}
+                arrival_id: {type: integer}
+      responses:
+        '201': {description: 申诉已提交待复核}
+        '409': {description: 尚无归因/同原因申诉重复/订单状态冲突}
+  /v1/stores/{id}/wait-thresholds:
+    get:
+      tags: [wait-attribution]
+      summary: 查看门店等待拆分可配置阈值（制作超时阈值/早到宽限/等待补贴单价）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+    patch:
+      tags: [wait-attribution]
+      summary: 修改门店等待拆分阈值（店长/区域经理）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                make_target_seconds: {type: integer, example: 900, description: 派单到出杯允许制作秒数}
+                early_grace_seconds: {type: integer, example: 0, description: 早于 ETA 宽限秒数}
+                subsidy_per_minute: {type: number, example: 0.5, description: 骑手等待补贴 元/分钟}
+      responses:
+        '200': {description: OK}
+  /v1/stores/{id}/wait-appeals:
+    get:
+      tags: [wait-attribution]
+      summary: 门店等待责任申诉列表（可按 status=pending/approved/rejected 过滤）
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer}}
+        - {name: status, in: query, schema: {type: string, enum: [pending, approved, rejected]}}
+      responses:
+        '200': {description: OK}
+  /v1/wait-appeals/{id}/review:
+    post:
+      tags: [wait-attribution]
+      summary: 区域经理复核申诉（通过则改判并自动回算时效/骑手补贴/平台指标/班组评分，保留原始归因）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, note]
+              properties:
+                decision: {type: string, enum: [approved, rejected]}
+                move_to_party: {type: string, enum: [platform, rider, waived], description: approved 时必填，把窗口内门店超时段改判给谁}
+                note: {type: string, description: 复核改判依据}
+      responses:
+        '200': {description: 复核完成（approved 时返回新归因版本与回算结果）}
+        '409': {description: 申诉已复核}
   /v1/customers/orders/{id}/complain:
     post:
       tags: [customer]

@@ -39,6 +39,7 @@ save(){ cp /tmp/cc126/last.json "/tmp/cc126/saved_$1.json"; }
 getf(){ jq -r "$1" "/tmp/cc126/saved_$2.json"; }
 
 PSQL="psql -h /tmp/cc126 -p 5433 -U coffee -d coffee -tA"
+TODAY="$(date +%F)"
 
 # 重置数据库与 Redis（测试脚本专用：drop/create 后由服务启动迁移自动重建）
 if [ "${SKIP_RESET:-0}" != "1" ]; then
@@ -286,7 +287,7 @@ SCORE=$(J .score)
 [ "$SCORE" -lt 100 ] && ok "班组评分因异常扣分 (<100, 实际 $SCORE)" || bad "评分未扣分 $SCORE"
 api GET /v1/management/team-scores 1001 > /tmp/cc126/last.json
 [ "$(J 'length')" = "1" ] && ok "班组评分榜可查" || bad "评分榜"
-RC=$(api_code POST /v1/management/stores/1/reviews 1002 '{"from":"2026-09-01","to":"2026-09-29","summary":"午高峰出杯慢、漏餐具集中，加强封签核对","actions":["高峰加派1人","出杯叫号培训"]}')
+RC=$(api_code POST /v1/management/stores/1/reviews 1002 "{\"from\":\"2026-09-01\",\"to\":\"$TODAY\",\"summary\":\"午高峰出杯慢、漏餐具集中，加强封签核对\",\"actions\":[\"高峰加派1人\",\"出杯叫号培训\"]}")
 expect_code 201 "督导复盘创建"
 jq -e '.remake_cost_total < 0' /tmp/cc126/last.json >/dev/null && ok "重做成本计入复盘 ($(J .remake_cost_total))" || bad "复盘重做成本"
 
@@ -297,6 +298,83 @@ echo "  订单1出现的角色: $ROLES"
 for role in platform barista rider customer finance; do
   echo "$ROLES" | grep -q "$role" && ok "时间线含 $role" || bad "时间线缺 $role"
 done
+
+echo
+echo "== 20. 骑手提前到店等待三段拆分 + 店长申诉 + 区域经理复核改判 =="
+# 阈值：制作目标 1 秒、等待补贴 0.5 元/分钟（确定性触发门店制作超时）
+RC=$(api_code PATCH /v1/stores/1/wait-thresholds 2001 '{"make_target_seconds":1,"subsidy_per_minute":0.5}')
+expect_code 200 "配置门店等待拆分阈值"
+[ "$(J .make_target_seconds)" = "1" ] && ok "制作超时阈值=1s" || bad "阈值未生效"
+BODYW='{"platform_order_no":"EM-E2E-W","store_id":1,"rider_eta":"2030-01-01T00:00:00Z","items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}'
+RC=$(api_code POST /v1/platform/orders 9001 "$BODYW"); expect_code 201 "等待单接单"
+OW=$(J .id)
+WCID=$(api GET "/v1/orders/$OW" 0000 | jq -r '.cups[0].id')
+RC=$(api_code POST /v1/rider/arrivals 4001 "{\"order_id\":$OW}"); expect_code 200 "骑手提前到店登记"
+[ "$(J '.orders[0].queue_cups')" -ge 1 ] && ok "到店记录当时排队杯量" || bad "排队杯量缺失"
+[ "$(J '.orders[0].surge.active')" = "false" ] && ok "到店记录门店爆单保护状态快照" || bad "爆单快照缺失"
+sleep 2
+api POST "/v1/staff/cups/$WCID/start" 3001 >/dev/null
+api POST "/v1/staff/cups/$WCID/seal" 3001 >/dev/null
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$OW,\"actual_bags\":1,\"actual_hot\":1}")
+expect_code 200 "等待单交接"
+[ "$(J '.wait_split_seconds|has("store_make_timeout")')" = "true" ] && ok "交接返回三段拆分" || bad "拆分字段缺失"
+[ "$(J '.wait_split_seconds.store_make_timeout')" -ge 1 ] && ok "超制作目标判为门店制作超时" || bad "门店超时未识别"
+[ "$(J '.subsidy_by_party.store')" != "null" ] && ok "门店超时产生骑手等待补贴（门店承担）" || bad "无门店等待补贴"
+RUN_BEFORE=$(J .attribution_run_id)
+api GET "/v1/orders/$OW/wait-attribution" 2001 > /tmp/cc126/last.json
+[ "$(J .version)" -ge 1 ] && ok "可查等待归因结果（版本 $(J .version)）" || bad "归因结果缺失"
+[ "$(J '[.run_history[]|.version]|length')" -ge 1 ] && ok "归因历史版本保留" || bad "无历史版本"
+# 店长申诉（机器故障）
+RC=$(api_code POST "/v1/orders/$OW/wait-appeals" 2001 '{"reason_code":"machine_fault","reason_detail":"意式机故障停机13分钟，监控工单FIX-W","evidence":{"ticket":"FIX-W"}}')
+expect_code 201 "店长发起等待责任申诉"
+[ "$(J .settlement_only)" = "true" ] && ok "已交接单申诉标记为仅结算改判" || bad "settlement_only 标记错误"
+WAP=$(J .appeal_id)
+# 店员/骑手无权复核
+RC=$(api_code POST "/v1/wait-appeals/$WAP/review" 3001 '{"decision":"approved","move_to_party":"waived","note":"x"}')
+expect_code 403 "店员无权复核（403）"
+# 区域经理复核通过 → 豁免门店超时段
+RC=$(api_code POST "/v1/wait-appeals/$WAP/review" 1001 '{"decision":"approved","move_to_party":"waived","note":"核实机器故障非班组责任，改判豁免，平台承担骑手补贴"}')
+expect_code 200 "区域经理复核通过改判"
+[ "$(J .attribution.summary_seconds.store_make_timeout)" = "0" ] && ok "改判后门店制作超时回算归零" || bad "门店超时未归零"
+[ "$(J .attribution.summary_seconds.waived)" -ge 1 ] && ok "改判产生豁免等待段" || bad "无豁免段"
+[ "$(J .settlement_only)" = "true" ] && ok "改判仅调整结算不改交接事实" || bad "settlement_only"
+[ "$(J .original_run_id)" != "$(J .effective_run_id)" ] && ok "保留原始归因版本并生成改判版本" || bad "原始/生效版本未区分"
+# 订单交接事实未改写
+api GET "/v1/orders/$OW" 0000 > /tmp/cc126/last.json
+[ "$(J .status)" = "handed" ] && ok "订单仍为 handed（交接事实未改写）" || bad "订单状态被改写"
+# 门店承担的骑手等待补贴净额被冲回为 0
+api GET "/v1/stores/1/finance?from=2020-01-01&to=2030-01-01" 6001 > /tmp/cc126/last.json
+STORE_NET=$(J '[.summary[]|select(.kind=="rider_wait_subsidy" and .bearer=="store")]|map(.amount)|add // 0')
+[ "$STORE_NET" = "0" ] && ok "改判后门店骑手等待补贴净额冲回为 0" || bad "门店补贴净额 $STORE_NET 未冲回"
+# 门店时效报表反映改判
+api GET "/v1/reports/stores/1/summary?from=2020-01-01&to=2030-01-01" 1001 > /tmp/cc126/last.json
+[ "$(J '.metrics.wait_appeals_approved')" -ge 1 ] && ok "报表统计到已核准等待申诉" || bad "报表无申诉统计"
+
+echo "== 21. 骑手离店再到店 + 改配重归因（不重复计时） =="
+BODYR='{"platform_order_no":"EM-E2E-R","store_id":1,"rider_eta":"2030-01-01T00:00:00Z","items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}'
+RC=$(api_code POST /v1/platform/orders 9001 "$BODYR"); expect_code 201 "改配场景单接单"
+ORP=$(J .id)
+RC=$(api_code POST /v1/rider/arrivals 4001 "{\"order_id\":$ORP}"); expect_code 200 "原骑手到店"
+RA1=$(J '.orders[0].arrival_id')
+RC=$(api_code POST "/v1/rider/arrivals/$RA1/leave" 4001); expect_code 200 "骑手离店收口等待"
+RC=$(api_code POST /v1/rider/arrivals 4001 "{\"order_id\":$ORP}"); expect_code 200 "骑手再到店"
+RA2=$(J '.orders[0].arrival_id')
+[ "$RA2" != "$RA1" ] && ok "离店后再到店新开记录" || bad "到店记录被复用"
+NARR=$($PSQL -c "SELECT count(*) FROM rider_arrivals WHERE order_id=$ORP")
+[ "$NARR" = "2" ] && ok "该单累计 2 条到店区间（离店期间不计等待）" || bad "到店区间数 $NARR"
+# 改派
+RC=$(api_code POST "/v1/platform/orders/$ORP/redispatch" 5001 '{"rider_name":"新骑手老吴","reason":"原骑手爆胎改派"}')
+expect_code 200 "平台改配并按时间线重新归因"
+[ "$(J .attribution.reason)" = "redispatched" ] && ok "改配触发重归因版本" || bad "改配重归因缺失"
+RCID=$(api GET "/v1/orders/$ORP" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$RCID/start" 3001 >/dev/null
+api POST "/v1/staff/cups/$RCID/seal" 3001 >/dev/null
+RC=$(api_code POST /v1/rider/arrivals 4002 "{\"order_id\":$ORP}"); expect_code 200 "改派后新骑手到店"
+RC=$(api_code POST /v1/rider/handoffs 4002 "{\"order_id\":$ORP,\"actual_bags\":1,\"actual_hot\":1}")
+expect_code 200 "改派单由新骑手交接"
+api GET "/v1/orders/$ORP/wait-attribution" 2001 > /tmp/cc126/last.json
+SEG_ARR=$(J '[.segments[]|.arrival_id]|unique|length')
+[ "$SEG_ARR" -ge 2 ] && ok "归因段覆盖多个到店区间且互不重叠" || bad "到店区间覆盖异常 ($SEG_ARR)"
 
 echo
 echo "================ 结果: PASS=$PASS FAIL=$FAIL ================"

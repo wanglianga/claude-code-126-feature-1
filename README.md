@@ -9,6 +9,7 @@
 - 店员扫描封签 → 生成封签码 → **热饮 / 冷饮 / 餐食自动分袋** → 全单封齐进入待取区
 - 骑手到店核验：**订单号、袋数、冷热分袋、吸管、餐具**；未出杯禁止取走
 - 全场景异常：骑手提前到店、饮品放置过久重做、顾客备注漏看、错杯、轻食缺货、骑手取错袋、平台取消订单、顾客漏液投诉
+- **骑手提前到店等待责任拆分与争议复核**：记录骑手到店、实际派单（含改配）、门店开始制作、出杯、封签、交接时间，以及到店时**排队杯量、排队位序与门店爆单保护状态快照**；按可配置阈值把等待拆为 **平台派单过早 / 门店制作超时 / 骑手提前到店（+ 复核豁免）** 四段，互不重叠、不重复计时；改配、重做、骑手离店再到店时按事件时间线整单重归因；店长可对机器故障/临时缺货等申诉，区域经理复核后才生效，改判自动回算门店时效、骑手等待补贴、平台服务指标与班组评分，原始归因版本全保留；订单已取消/已交接时申诉只改绩效结算，不改交接事实
 - **重做报损**：旧杯作废+报损成本，新杯重新入队，重做成本计入门店班组复盘与财务
 - **缺货自动临时下架**（按原料反查商品），补货且原料齐备后自动恢复上架
 - 平台取消：未制作杯原料回库、已封杯报损、按门店/平台责任退款
@@ -133,6 +134,39 @@ curl -s http://localhost:8080/v1/orders/1/events -H "X-Staff-Code: 0000"
 更多场景（重做、缺货下架、爆单、取消、合并、报表、班组评分、复盘）均在
 `scripts/e2e.sh` 中有可运行的完整演示，建议配合阅读。
 
+### 骑手提前到店：等待三段拆分 → 店长申诉 → 区域经理复核改判
+
+```bash
+# 1) 店长配置阈值：制作目标 900 秒、早到宽限 0、骑手等待补贴 0.5 元/分钟
+curl -s -X PATCH http://localhost:8080/v1/stores/1/wait-thresholds   -H "X-Staff-Code: 2001" -H "Content-Type: application/json"   -d '{"make_target_seconds":900,"early_grace_seconds":0,"subsidy_per_minute":0.5}'
+
+# 2) 平台推单（实际派单时间自动记录）；骑手提前到店（自动快照排队杯量/位序/爆单状态）
+curl -s -X POST http://localhost:8080/v1/rider/arrivals   -H "X-Staff-Code: 4001" -H "Content-Type: application/json" -d '{"order_id":1}'
+
+# 骑手离店（离店期间不计等待，再到店自动新开一条到店记录）
+curl -s -X POST http://localhost:8080/v1/rider/arrivals/1/leave -H "X-Staff-Code: 4001"
+# 平台改配（更新实际派单时间线，收口旧骑手等待并整单重归因）
+curl -s -X POST http://localhost:8080/v1/platform/orders/1/redispatch   -H "X-Staff-Code: 5001" -H "Content-Type: application/json"   -d '{"rider_name":"新骑手老吴","reason":"原骑手爆胎改派"}'
+
+# 3) 交接后查看三段拆分（含全部历史版本与每次的计算依据 basis）
+curl -s http://localhost:8080/v1/orders/1/wait-attribution -H "X-Staff-Code: 2001"
+# summary_seconds: {rider_arrive_early, platform_dispatch_early, store_make_timeout, waived}
+
+# 4) 店长就「机器故障」对等待责任发起申诉（订单已交接时自动 settlement_only）
+curl -s -X POST http://localhost:8080/v1/orders/1/wait-appeals   -H "X-Staff-Code: 2001" -H "Content-Type: application/json"   -d '{"reason_code":"machine_fault","reason_detail":"12:02意式机故障停机，工单FIX-77",
+       "evidence":{"ticket":"FIX-77"},"window_from":"2026-09-30T12:10:00+08:00",
+       "window_to":"2026-09-30T12:23:00+08:00"}'
+
+# 5) 区域经理复核通过，把窗口内门店制作超时改判豁免（waived），同事务自动回算：
+#    门店时效、骑手等待补贴（净额冲回重结）、平台服务指标、当日班组评分
+curl -s -X POST http://localhost:8080/v1/wait-appeals/1/review   -H "X-Staff-Code: 1001" -H "Content-Type: application/json"   -d '{"decision":"approved","move_to_party":"waived",
+       "note":"核实机器故障13分钟，非门店班组责任，豁免，平台承担骑手补贴"}'
+```
+
+- 复核后再查 `GET /v1/orders/1/wait-attribution` 可见新版本（门店超时归零、出现 `waived` 段），
+  而 `run_history` 中**原始交接版本仍保留**；`GET /v1/stores/1/wait-appeals` 可看 `original_run_id` 与 `effective_run_id`。
+- 订单已交接/取消时，复核结果带 `"settlement_only":true`，订单状态、`handed_at`、交接核验记录**不被改写**，只改绩效与结算。
+
 ---
 
 ## 4. 本地开发（不使用 Docker）
@@ -181,13 +215,14 @@ go build -o /tmp/cc126/server ./cmd/server
 | --- | --- |
 | 鉴权 | `POST /v1/auth/login`、`GET /v1/auth/me` |
 | 基础数据 | `GET /v1/stores`、`GET /v1/menu`、`GET /v1/stores/{id}/inventory`、`GET /v1/stores/{id}/board` |
-| 平台接单 | `POST /v1/platform/orders`（支持 `Idempotency-Key`）、`POST /v1/platform/orders/{id}/cancel` |
+| 平台接单 | `POST /v1/platform/orders`（支持 `Idempotency-Key`）、`POST /v1/platform/orders/{id}/cancel`、`POST /v1/platform/orders/{id}/redispatch`（改配，触发等待重归因） |
 | 门店作业 | `GET /v1/staff/stores/{id}/queue`、`POST /v1/staff/stores/{id}/cups/next`、`POST /v1/staff/cups/{id}/start`、`POST /v1/staff/cups/{id}/seal`、`POST /v1/staff/cups/{id}/remake` |
 | 缺货/下架 | `POST /v1/staff/orders/{id}/item-oos`、`POST /v1/staff/menu/{sku}/delist`、`GET /v1/stores/{id}/delistings`、`POST /v1/staff/inventory/restock` |
 | 打印 | `GET /v1/staff/orders/{id}/cup-labels`、`GET /v1/staff/orders/{id}/bag-labels` |
 | 爆单保护 | `POST /v1/staff/stores/{id}/surge` |
 | 订单合并 | `POST /v1/staff/merge`、`GET /v1/merged-groups/{id}` |
-| 骑手 | `POST /v1/rider/arrivals`、`GET /v1/rider/screen`、`GET /v1/rider/arrivals/{id}`、`POST /v1/rider/handoffs` |
+| 骑手 | `POST /v1/rider/arrivals`、`POST /v1/rider/arrivals/{id}/leave`（离店，离店再到店新开记录）、`GET /v1/rider/screen`、`GET /v1/rider/arrivals/{id}`、`POST /v1/rider/handoffs` |
+| 等待拆分/申诉 | `GET/PATCH /v1/stores/{id}/wait-thresholds`（可配置阈值）、`GET /v1/orders/{id}/wait-attribution`（三段归因+历史版本）、`POST /v1/orders/{id}/wait-appeals`（店长申诉）、`GET /v1/stores/{id}/wait-appeals`、`POST /v1/wait-appeals/{id}/review`（区域经理复核改判） |
 | 顾客/客服 | `POST /v1/customers/orders/{id}/complain` |
 | 财务 | `PATCH /v1/finance/exceptions/{id}`、`GET /v1/stores/{id}/finance` |
 | 订单查询 | `GET /v1/orders/{id}`、`GET /v1/orders/{id}/events`、`GET /v1/orders/{id}/exceptions` |
@@ -202,29 +237,41 @@ go build -o /tmp/cc126/server ./cmd/server
 - **分袋**：热饮→热袋、冰饮→冷袋、轻食→餐食袋；含饮品的组合套餐按其饮品冰热入袋。同温层首杯封签时扣减对应袋耗材。
 - **重做**：旧杯 `voided` 并报损（按配方成本），新杯继承原杯序号重新入队，`remake_no+1`；
   重做成本写 `finance_records(kind=remake_cost, bearer=team)`，进入班组复盘。
-- **骑手等待责任**：交接时计算等待时长；骑手早于自身 ETA 到店的提前量不计门店责任，
-  超过 ETA 仍等不到杯的部分记为门店出杯慢（`store_fault_wait_seconds`）。
+- **骑手等待责任三段拆分**：每次到店记录实际派单时间、开做/出杯/封签/交接时间，以及到店时排队杯量、排队位序、爆单保护状态快照；等待只在「骑手在店且未出杯」区间计时，按可配置阈值（`wait_thresholds`：制作目标秒数、早到宽限、补贴单价）切成互不重叠的四段：
+  - `rider_arrive_early` 骑手提前到店：仍在制作目标窗口内且早于「ETA-早到宽限」；
+  - `platform_dispatch_early` 平台派单过早：制作目标窗口内骑手已在等的其余部分（含准点到店等待）；
+  - `store_make_timeout` 门店制作超时：超过「实际派单时间 + 制作目标秒数」仍未出杯（门店制作 SLA 优先，与骑手是否早到无关）；
+  - `waived` 豁免段：区域经理复核改判产生，不计门店绩效。
+  - 改配、重做、骑手离店再到店时按 `order_events` 时间线**整单重新归因**，每次生成一个新版本（`wait_attribution_runs`/`wait_segments`），同一段等待只在最新版本计入，避免重复计入门店绩效和骑手补偿。
+  - 非骑手责任等待按秒折算骑手等待补贴（`finance_records(kind=rider_wait_subsidy)`），终态（离店/交接/取消/复核改判）结算；改判时对原版本净额整组冲回（`[冲回]` 流水保留可审计）再按新版本重结，累计不重复。
+- **争议复核**：店长对机器故障/临时缺货/人手不足/爆单连锁等发起申诉（`wait_appeals`，状态 pending）；区域经理（且属同区域）复核通过后可把申诉窗口内门店超时段改判给 `platform`/`rider`/`waived`，生成新归因版本（**原始归因与改判依据保留**），并在同一事务回算门店时效报表、骑手等待补贴、平台服务指标和当日班组评分（新增「门店制作超时等待每满 5 分钟扣 1 分」）；驳回不改任何结算。**订单已交接或已取消的，`settlement_only=true`，只调整绩效结算，`orders`/`handoffs` 等交接事实一律不改写。**
 - **取消**：未做/制作中杯原料回库（`cancel_restock`），已封杯按报损处理；退款承担方由 `store_fault` 决定。
-- **班组评分**：100 分起，慢单率（每 5% 扣 1）、错杯(-4)、漏吸管餐具(-2)、取错袋(-2)、饮品过久(-3)、漏备注(-2)、门店责任取消(-5)。
+- **班组评分**：100 分起，慢单率（每 5% 扣 1）、错杯(-4)、漏吸管餐具(-2)、取错袋(-2)、饮品过久(-3)、漏备注(-2)、门店责任取消(-5)、门店制作超时等待（每满 5 分钟扣 1，取每单最新归因版本，复核改判自动回算）。
 
 ---
 
 ## 6. 已执行的验证结论
 
-以下验证在交付环境中实际执行通过（日期 2026-09-29）：
+以下验证在交付环境中实际执行通过（最近一次完整执行日期 2026-09-30）：
 
 1. `go vet ./...` 无告警；`go build ./cmd/server` 通过。
-2. `go test ./...` 通过：含 8 个集成测试用例（自动建 `coffee_test` 库）与 OpenAPI 3.0 规范合法性/路径覆盖测试。
-3. `scripts/e2e.sh` 端到端 **81/81 项断言全部通过**，覆盖 19 个场景段：
-   健康检查、接单四杯生成、库存扣减（牛奶/封签/吸管/餐具数量逐一核对）、幂等重推、
-   出杯队列与备注、四杯封签与 3 个冷热餐食分袋、杯贴袋贴、骑手提前到店与到店屏、
-   未出杯拒交接、取错袋 409 与正确交接 200、漏吸管漏餐具识别、投诉受理与财务定责（含平台分摊）、
-   过久重做报损与新杯回队、冷萃液缺货自动下架（`stock_shortage`→`item_delisted`）、
-   补货后自动恢复上架、轻食接单后缺货单品退款下架、爆单手动暂停（`surge_paused`）与
-   容量阈值（`surge_full`）、平台取消原料回库与退款归责、饿了么+美团多平台合并一次到店、
-   门店/区域报表、班组评分扣分、督导复盘含重做成本、订单时间线含 platform/barista/rider/customer/finance 五类角色。
+2. `go test ./...` 通过：新增 **13 个等待归因纯逻辑单测**（三段切分、早到宽限、离店再到店、
+   改配重置制作目标、重做不重复计时、复核改判窗口切割（含跨窗口起止边界）、补贴折算）与 **2 个新集成测试**
+   （三段拆分→交接结算→店长申诉→区域经理复核回算全链路；离店再到店双记录），
+   连同既有 8 个集成测试与 OpenAPI 3.0 合法性/路径覆盖测试全部通过。
+3. `scripts/e2e.sh` 端到端 **115/115 项断言全部通过**，覆盖 21 个场景段；除原有 19 段外，新增：
+   - **第 20 段 等待责任拆分与争议复核**：配置可编辑阈值（制作目标/宽限/补贴单价）、
+     到店快照排队杯量与爆单状态、交接返回四段拆分与骑手等待补贴、归因历史版本可查、
+     店长机器故障申诉（已交接单 `settlement_only=true`）、店员复核 403、区域经理改判豁免后
+     门店超时归零并产生豁免段、原始/生效版本分离、订单仍 handed（交接事实未改写）、
+     门店承担补贴净额冲回为 0、门店报表统计已核准申诉；
+   - **第 21 段 离店再到店 + 改配重归因**：离店收口等待区间、再到店新开记录（该单 2 条区间）、
+     平台改派触发 `redispatched` 重归因版本、新骑手到店交接、归因段覆盖多个到店区间且互不重叠。
 4. Swagger UI（`/swagger/`）、`/openapi.yaml`、内嵌静态资源均返回 200；`/healthz` 返回 PG/Redis 均 ok。
-5. Dockerfile / docker-compose.yml 已提供，可 `docker compose up -d --build` 一键启动
+5. 新增数据库迁移 `0003_wait_attribution.sql`（可重复执行）：`orders.dispatched_at`、
+   `rider_arrivals` 快照与离店字段、`wait_thresholds`、`wait_attribution_runs`、
+   `wait_segments`、`wait_appeals`、`finance_records.run_id`；升级库重启即自动迁移，不影响存量数据。
+6. Dockerfile / docker-compose.yml 已提供，可 `docker compose up -d --build` 一键启动
    （交付沙箱无 Docker 守护进程，未在沙箱内实际构建；镜像构建仅依赖标准 `golang:1.22-alpine` 与 `alpine:3.19`，应用为 CGO_ENABLED=0 静态二进制）。
 
 ---
@@ -236,18 +283,19 @@ go build -o /tmp/cc126/server ./cmd/server
 ├── cmd/server/main.go          # 入口：读环境变量、连库、迁移、起 HTTP
 ├── internal/
 │   ├── db/                     # pgxpool 连接 + 内嵌 SQL 迁移执行器
-│   │   └── sql/                # 0001 建表 / 0002 种子数据（随二进制 embed）
+│   │   └── sql/                # 0001 建表 / 0002 种子 / 0003 等待归因与申诉（随二进制 embed）
 │   └── app/
 │       ├── server.go           # 路由、角色鉴权、登录
 │       ├── orders.go           # 接单、配方库存、幂等、缺货下架、平台取消
 │       ├── production.go       # 出杯队列、封签分袋、重做报损、轻食缺货、叫号
-│       ├── rider.go            # 骑手到店、到店屏、核验交接与等待归责
+│       ├── rider.go            # 骑手到店、到店屏、离店再到店、核验交接
+│       ├── waitattr.go         # 等待三段拆分引擎、版本化重归因、补贴结算、申诉与复核回算
 │       ├── management.go       # 门店/库存/爆单/合并/杯贴袋贴/看板
 │       ├── reports.go          # 投诉、财务定责、台账、门店/区域报表、评分、复盘
 │       ├── models.go           # JSON 模型
 │       ├── swagger.go          # 内嵌 Swagger UI + OpenAPI
 │       └── web/                # openapi.yaml + swagger-ui-dist 静态资源
-├── scripts/e2e.sh              # 端到端冒烟脚本（80 断言）
+├── scripts/e2e.sh              # 端到端冒烟脚本（115 断言 / 21 场景段）
 ├── Dockerfile
 └── docker-compose.yml
 ```

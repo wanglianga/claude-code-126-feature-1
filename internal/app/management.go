@@ -610,7 +610,7 @@ func (a *App) storeBoard(w http.ResponseWriter, r *http.Request) {
 		  (SELECT count(*) FROM orders WHERE store_id=s.id AND status='active'),
 		  (SELECT count(*) FROM orders WHERE store_id=s.id AND status='received'),
 		  (SELECT count(*) FROM rider_arrivals ra JOIN orders o ON o.id=ra.order_id
-		     WHERE ra.store_id=s.id AND ra.handed_at IS NULL AND o.status<>'canceled'),
+		     WHERE ra.store_id=s.id AND ra.handed_at IS NULL AND ra.left_at IS NULL AND o.status<>'canceled'),
 		  (SELECT count(*) FROM orders WHERE store_id=s.id AND status='active'
 		     AND all_sealed_at IS NOT NULL AND all_sealed_at < now() - make_interval(mins => s.stale_minutes)),
 		  (SELECT count(*) FROM exceptions WHERE store_id=s.id AND status='open'),

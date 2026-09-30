@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -18,15 +19,18 @@ type arriveReq struct {
 }
 
 type arriveItem struct {
-	ArrivalID   int64  `json:"arrival_id"`
-	OrderID     int64  `json:"order_id"`
-	Ready       bool   `json:"ready"`
-	OrderStatus string `json:"order_status"`
-	SealedCups  int    `json:"sealed_cups"`
-	TotalCups   int    `json:"total_cups"`
-	Early       bool   `json:"early"`
-	Bags        any    `json:"bags"`
-	ExceptionID *int64 `json:"exception_id,omitempty"`
+	ArrivalID     int64          `json:"arrival_id"`
+	OrderID       int64          `json:"order_id"`
+	Ready         bool           `json:"ready"`
+	OrderStatus   string         `json:"order_status"`
+	SealedCups    int            `json:"sealed_cups"`
+	TotalCups     int            `json:"total_cups"`
+	Early         bool           `json:"early"`
+	QueueCups     int            `json:"queue_cups"`
+	QueuePosition int            `json:"queue_position"`
+	Surge         map[string]any `json:"surge,omitempty"`
+	Bags          any            `json:"bags"`
+	ExceptionID   *int64         `json:"exception_id,omitempty"`
 }
 
 func (a *App) riderArrive(w http.ResponseWriter, r *http.Request) {
@@ -109,23 +113,70 @@ func (a *App) riderArrive(w http.ResponseWriter, r *http.Request) {
 		}
 		ready := status == "active" || (totalN > 0 && sealedN == totalN)
 
-		// 已存在未完成到店记录则复用
+		// 已存在「未离店、未交接」到店记录则复用；离店后再到店开新记录
 		var arrivalID int64
 		err := tx.QueryRow(ctx,
-			`SELECT id FROM rider_arrivals WHERE order_id=$1 AND handed_at IS NULL ORDER BY id DESC LIMIT 1`,
+			`SELECT id FROM rider_arrivals
+			 WHERE order_id=$1 AND handed_at IS NULL AND left_at IS NULL
+			 ORDER BY id DESC LIMIT 1`,
 			oid).Scan(&arrivalID)
 		if err != nil {
 			var aid int64
+			// 到店时刻排队杯量（全店在制/待制杯）与该单排队位序（按骑手 ETA 排序在其之前的在制单数）
+			var queueCups, queuePosition int
 			if err := tx.QueryRow(ctx, `
-				INSERT INTO rider_arrivals(store_id,order_id,group_id,rider_account_id,rider_name,platform,ready_at)
-				VALUES($1,$2,$3,$4,$5,$6,CASE WHEN $7 THEN now() ELSE NULL END) RETURNING id`,
-				storeID, oid, req.GroupID, ac.ID, req.RiderName, ac.Platform, ready).Scan(&aid); err != nil {
+				SELECT count(*) FROM order_cups c JOIN orders o ON o.id=c.order_id
+				WHERE o.store_id=$1 AND c.status IN ('queued','making')
+				  AND o.status IN ('received','active')`, storeID).Scan(&queueCups); err != nil {
+				writeErr(w, err)
+				return
+			}
+			if err := tx.QueryRow(ctx, `
+				SELECT count(*) FROM orders
+				WHERE store_id=$1 AND status IN ('received','active') AND id<>$2
+				  AND COALESCE(rider_eta, ordered_at + interval '30 min')
+				      <= COALESCE((SELECT rider_eta FROM orders WHERE id=$2),
+				                  (SELECT ordered_at + interval '30 min' FROM orders WHERE id=$2))`,
+				storeID, oid).Scan(&queuePosition); err != nil {
+				writeErr(w, err)
+				return
+			}
+			// 到店时刻门店爆单保护状态快照（手动暂停/容量上限）
+			var surgeManual bool
+			var surgeReason string
+			var surgeUntil *time.Time
+			var maxActive int
+			if err := tx.QueryRow(ctx,
+				`SELECT surge_manual,COALESCE(surge_reason,''),surge_until,max_active_cups
+				 FROM stores WHERE id=$1`, storeID).Scan(&surgeManual, &surgeReason, &surgeUntil, &maxActive); err != nil {
+				writeErr(w, err)
+				return
+			}
+			surgeActive := surgeManual && (surgeUntil == nil || surgeUntil.After(time.Now()))
+			surgeSnap := map[string]any{
+				"manual_paused":   surgeManual,
+				"active":          surgeActive,
+				"reason":          surgeReason,
+				"surge_until":     surgeUntil,
+				"queue_cups":      queueCups,
+				"max_active_cups": maxActive,
+				"at_capacity":     queueCups >= maxActive,
+			}
+			if err := tx.QueryRow(ctx, `
+				INSERT INTO rider_arrivals(store_id,order_id,group_id,rider_account_id,rider_name,platform,ready_at,
+					queue_cups,queue_position,surge_snapshot)
+				VALUES($1,$2,$3,$4,$5,$6,CASE WHEN $7 THEN now() ELSE NULL END,$8,$9,$10) RETURNING id`,
+				storeID, oid, req.GroupID, ac.ID, req.RiderName, ac.Platform, ready,
+				queueCups, queuePosition, surgeSnap).Scan(&aid); err != nil {
 				writeErr(w, err)
 				return
 			}
 			arrivalID = aid
 			etype := "rider_arrived"
-			detail := map[string]any{"rider": req.RiderName, "ready": ready}
+			detail := map[string]any{
+				"rider": req.RiderName, "ready": ready,
+				"queue_cups": queueCups, "queue_position": queuePosition, "surge": surgeSnap,
+			}
 			if !ready {
 				etype = "rider_arrived_early"
 				var excID *int64
@@ -139,8 +190,10 @@ func (a *App) riderArrive(w http.ResponseWriter, r *http.Request) {
 					if err := tx.QueryRow(ctx, `
 						INSERT INTO exceptions(order_id,store_id,type,status,responsibility,detail,created_by)
 						VALUES($1,$2,'rider_early','open','pending',$3,$4) RETURNING id`,
-						oid, storeID, map[string]any{"rider": req.RiderName, "sealed": sealedN, "total": totalN},
-						ac.ID).Scan(&newID); err != nil {
+						oid, storeID, map[string]any{
+							"rider": req.RiderName, "sealed": sealedN, "total": totalN,
+							"queue_cups": queueCups, "queue_position": queuePosition, "surge": surgeSnap,
+						}, ac.ID).Scan(&newID); err != nil {
 						writeErr(w, err)
 						return
 					}
@@ -151,6 +204,7 @@ func (a *App) riderArrive(w http.ResponseWriter, r *http.Request) {
 				results = append(results, arriveItem{
 					ArrivalID: arrivalID, OrderID: oid, Ready: false, OrderStatus: status,
 					SealedCups: sealedN, TotalCups: totalN, Early: true,
+					QueueCups: queueCups, QueuePosition: queuePosition, Surge: surgeSnap,
 					Bags: bagSummary(ctx, tx, oid), ExceptionID: excID,
 				})
 			}
@@ -158,10 +212,17 @@ func (a *App) riderArrive(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, err)
 				return
 			}
+			// 到店即产生一版等待归因（在途按当前观察终点；交接/离店/改配时再重算）
+			if _, err := a.recomputeWaitAttribution(ctx, tx, oid, "arrived", nil, ac.ID); err != nil {
+				writeErr(w, err)
+				return
+			}
 			if ready {
 				results = append(results, arriveItem{
 					ArrivalID: arrivalID, OrderID: oid, Ready: true, OrderStatus: status,
-					SealedCups: sealedN, TotalCups: totalN, Bags: bagSummary(ctx, tx, oid),
+					SealedCups: sealedN, TotalCups: totalN,
+					QueueCups: queueCups, QueuePosition: queuePosition, Surge: surgeSnap,
+					Bags: bagSummary(ctx, tx, oid),
 				})
 			}
 			continue
@@ -182,27 +243,37 @@ func (a *App) riderArrive(w http.ResponseWriter, r *http.Request) {
 func (a *App) getArrival(w http.ResponseWriter, r *http.Request) {
 	id := toInt64(chi.URLParam(r, "id"))
 	var v struct {
-		ID        int64      `json:"id"`
-		StoreID   int64      `json:"store_id"`
-		OrderID   int64      `json:"order_id"`
-		RiderName string     `json:"rider_name"`
-		Platform  string     `json:"platform"`
-		ArrivedAt time.Time  `json:"arrived_at"`
-		ReadyAt   *time.Time `json:"ready_at,omitempty"`
-		WaitSec   *int       `json:"wait_seconds,omitempty"`
-		StoreWait int        `json:"store_fault_wait_seconds"`
-		HandedAt  *time.Time `json:"handed_at,omitempty"`
+		ID            int64          `json:"id"`
+		StoreID       int64          `json:"store_id"`
+		OrderID       int64          `json:"order_id"`
+		RiderName     string         `json:"rider_name"`
+		Platform      string         `json:"platform"`
+		ArrivedAt     time.Time      `json:"arrived_at"`
+		LeftAt        *time.Time     `json:"left_at,omitempty"`
+		ReadyAt       *time.Time     `json:"ready_at,omitempty"`
+		WaitSec       *int           `json:"wait_seconds,omitempty"`
+		StoreWait     int            `json:"store_fault_wait_seconds"`
+		HandedAt      *time.Time     `json:"handed_at,omitempty"`
+		QueueCups     int            `json:"queue_cups"`
+		QueuePosition int            `json:"queue_position"`
+		Surge         map[string]any `json:"surge_snapshot"`
+		WaitSplit     map[string]int `json:"wait_split_seconds"`
 	}
+	var surgeRaw, splitRaw []byte
 	err := a.Pool.QueryRow(r.Context(), `
-		SELECT id,store_id,order_id,rider_name,COALESCE(platform,''),arrived_at,ready_at,
-		       wait_seconds,store_fault_wait_seconds,handed_at
+		SELECT id,store_id,order_id,rider_name,COALESCE(platform,''),arrived_at,left_at,ready_at,
+		       wait_seconds,store_fault_wait_seconds,handed_at,
+		       queue_cups,queue_position,surge_snapshot,wait_split
 		FROM rider_arrivals WHERE id=$1`, id).Scan(
 		&v.ID, &v.StoreID, &v.OrderID, &v.RiderName, &v.Platform, &v.ArrivedAt,
-		&v.ReadyAt, &v.WaitSec, &v.StoreWait, &v.HandedAt)
+		&v.LeftAt, &v.ReadyAt, &v.WaitSec, &v.StoreWait, &v.HandedAt,
+		&v.QueueCups, &v.QueuePosition, &surgeRaw, &splitRaw)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	_ = json.Unmarshal(surgeRaw, &v.Surge)
+	_ = json.Unmarshal(splitRaw, &v.WaitSplit)
 	writeJSON(w, 200, v)
 }
 
@@ -219,7 +290,7 @@ func (a *App) riderScreen(w http.ResponseWriter, r *http.Request) {
 		FROM rider_arrivals ra
 		JOIN stores s ON s.id=ra.store_id
 		JOIN orders o ON o.id=ra.order_id
-		WHERE ra.handed_at IS NULL AND o.status<>'canceled'`
+		WHERE ra.handed_at IS NULL AND ra.left_at IS NULL AND o.status<>'canceled'`
 	args := []any{}
 	if sid := q.Get("store_id"); sid != "" {
 		sql += " AND ra.store_id=$1"
@@ -526,81 +597,68 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 关闭该单的 open 异常（rider_early 等到交接时由财务/客服定责的不自动关？
-	// rider_early 在交接时按等待时长归责）
-	var waitSec, storeWaitSec int
+	// 关闭该单未收口到店记录并按时间线做最终等待责任拆分
 	arrRows, err := tx.Query(ctx,
-		`SELECT id,arrived_at,ready_at FROM rider_arrivals WHERE order_id=$1 AND handed_at IS NULL ORDER BY id FOR UPDATE`,
+		`SELECT id FROM rider_arrivals WHERE order_id=$1 AND handed_at IS NULL ORDER BY id FOR UPDATE`,
 		req.OrderID)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	type arr struct {
-		id        int64
-		arrivedAt time.Time
-	}
-	var arrs []arr
-	now := time.Now()
+	var openArrivals []int64
 	for arrRows.Next() {
-		var x arr
-		var readyAt *time.Time
-		_ = arrRows.Scan(&x.id, &x.arrivedAt, &readyAt)
-		arrs = append(arrs, x)
+		var id int64
+		_ = arrRows.Scan(&id)
+		openArrivals = append(openArrivals, id)
 	}
 	arrRows.Close()
-	// 门店责任等待：骑手按预计时间到店（或迟到）却等不到杯的部分；
-	// 骑手早于自身 ETA 到店的提前量不计门店责任。
-	storeFaultStart := now
-	if o.RiderETA != nil {
-		storeFaultStart = *o.RiderETA
-	}
-	for _, x := range arrs {
-		wait := int(now.Sub(x.arrivedAt).Seconds())
-		if wait < 0 {
-			wait = 0
-		}
-		waitSec += wait
-		var wasEarly bool
-		_ = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM exceptions WHERE order_id=$1 AND type='rider_early' AND status='open')`,
-			req.OrderID).Scan(&wasEarly)
-		sw := 0
-		if wasEarly {
-			sw = int(now.Sub(maxTime(x.arrivedAt, storeFaultStart)).Seconds())
-			if sw < 0 {
-				sw = 0
-			}
-			if sw > wait {
-				sw = wait
-			}
-			storeWaitSec += sw
-		}
-		readyAt := o.AllSealedAt
-		if readyAt == nil {
-			t := now
-			readyAt = &t
-		}
+	for _, id := range openArrivals {
 		if _, err := tx.Exec(ctx,
-			`UPDATE rider_arrivals SET handed_at=now(),wait_seconds=$2,store_fault_wait_seconds=$3,ready_at=$4 WHERE id=$1`,
-			x.id, wait, sw, readyAt); err != nil {
+			`UPDATE rider_arrivals SET handed_at=now(),ready_at=COALESCE(ready_at,$2) WHERE id=$1`,
+			id, o.AllSealedAt); err != nil {
 			writeErr(w, err)
 			return
 		}
-		if wasEarly {
-			resp := "rider"
-			resolution := fmt.Sprintf("骑手提前到店等待 %d 秒，未超过预计到店时间，等待责任归骑手", wait)
-			if sw > 0 {
-				resp = "store"
-				resolution = fmt.Sprintf("骑手等待 %d 秒，其中超过预计到店时间 %d 秒为门店出杯慢，责任归门店", wait, sw)
-			}
-			if _, err := tx.Exec(ctx, `
-				UPDATE exceptions SET status='resolved',resolved_at=now(),resolved_by=$2,
-				  responsibility=$3,resolution=$4
-				WHERE order_id=$1 AND type='rider_early' AND status='open'`,
-				req.OrderID, ac.ID, resp, resolution); err != nil {
-				writeErr(w, err)
-				return
-			}
+	}
+
+	attr, err := a.recomputeWaitAttribution(ctx, tx, req.OrderID, "handoff", nil, ac.ID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	storeWaitSec := attr.Summary[segStoreMakeTimeout]
+	waitSec := attr.Summary[segRiderEarly] + attr.Summary[segPlatformEarly] +
+		attr.Summary[segStoreMakeTimeout] + attr.Summary[segWaived]
+
+	// rider_early 异常按最终拆分定责（含平台派单过早）
+	var wasEarly bool
+	_ = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM exceptions WHERE order_id=$1 AND type='rider_early' AND status='open')`,
+		req.OrderID).Scan(&wasEarly)
+	if wasEarly {
+		resp := "rider"
+		resolution := fmt.Sprintf(
+			"骑手提前到店等待 %d 秒（骑手责任 %d 秒、平台派单过早 %d 秒、门店制作超时 %d 秒、豁免 %d 秒），等待责任归骑手",
+			waitSec, attr.Summary[segRiderEarly], attr.Summary[segPlatformEarly],
+			attr.Summary[segStoreMakeTimeout], attr.Summary[segWaived])
+		if attr.Summary[segStoreMakeTimeout] > 0 {
+			resp = "store"
+			resolution = fmt.Sprintf(
+				"骑手等待 %d 秒，其中门店制作超时 %d 秒、平台派单过早 %d 秒、骑手提前 %d 秒、豁免 %d 秒；门店超时部分归门店",
+				waitSec, attr.Summary[segStoreMakeTimeout], attr.Summary[segPlatformEarly],
+				attr.Summary[segRiderEarly], attr.Summary[segWaived])
+		} else if attr.Summary[segPlatformEarly] > attr.Summary[segRiderEarly] {
+			resp = "platform"
+			resolution = fmt.Sprintf(
+				"骑手等待 %d 秒，主要为平台派单过早 %d 秒，骑手提前 %d 秒，责任归平台",
+				waitSec, attr.Summary[segPlatformEarly], attr.Summary[segRiderEarly])
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE exceptions SET status='resolved',resolved_at=now(),resolved_by=$2,
+			  responsibility=$3,resolution=$4
+			WHERE order_id=$1 AND type='rider_early' AND status='open'`,
+			req.OrderID, ac.ID, resp, resolution); err != nil {
+			writeErr(w, err)
+			return
 		}
 	}
 
@@ -608,6 +666,7 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 		"rider": riderName, "bags": expBags, "hot": expHot, "cold": expCold, "food": expFood,
 		"straw": hasStraw, "utensil": hasUtensil, "wait_seconds": waitSec,
 		"store_fault_wait_seconds": storeWaitSec,
+		"wait_split":               attr.Summary, "attribution_run_id": attr.RunID,
 	}); err != nil {
 		writeErr(w, err)
 		return
@@ -620,12 +679,7 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 		"passed": true, "order_id": req.OrderID, "status": "handed",
 		"bags": expBags, "hot": expHot, "cold": expCold, "food": expFood,
 		"rider_wait_seconds": waitSec, "store_fault_wait_seconds": storeWaitSec,
+		"wait_split_seconds": attr.Summary, "subsidy_by_party": attr.Subsidy,
+		"attribution_run_id": attr.RunID,
 	})
-}
-
-func maxTime(a, b time.Time) time.Time {
-	if a.After(b) {
-		return a
-	}
-	return b
 }

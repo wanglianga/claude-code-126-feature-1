@@ -85,6 +85,7 @@ type Order struct {
 	TotalAmount     float64    `json:"total_amount"`
 	PromisedMinutes int        `json:"promised_minutes"`
 	OrderedAt       time.Time  `json:"ordered_at"`
+	DispatchedAt    *time.Time `json:"dispatched_at,omitempty"`
 	RiderETA        *time.Time `json:"rider_eta,omitempty"`
 	AllSealedAt     *time.Time `json:"all_sealed_at,omitempty"`
 	HandedAt        *time.Time `json:"handed_at,omitempty"`
